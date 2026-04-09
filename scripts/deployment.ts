@@ -30,7 +30,7 @@ const intents =
 const gatewayConfig = {
     log_level: 'info',
     intents,
-    externally_accessible_url: 'wss://discord-gateway.kimaki.xyz',
+    externally_accessible_url: 'wss://discord-gateway.kimaki.dev',
     cache: {
         // Channels, roles, and current_member are needed so the synthetic
         // READY event includes guild data for gateway bot mode clients.

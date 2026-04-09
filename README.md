@@ -230,7 +230,7 @@ Using 225 shards, with almost full caching (members, guilds, channels, roles, vo
 
 ## Kimaki onboarding flow
 
-When used with [kimaki](https://kimaki.xyz), the proxy enables a zero-config onboarding experience where users install a shared Discord bot without creating their own.
+When used with [kimaki](https://kimaki.dev), the proxy enables a zero-config onboarding experience where users install a shared Discord bot without creating their own.
 
 ```
 User's terminal                          Browser       Website (CF Worker)  Postgres    Gateway Proxy

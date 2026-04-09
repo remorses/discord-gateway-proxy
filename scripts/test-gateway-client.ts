@@ -2,7 +2,7 @@
 /**
  * Test script to verify discord.js can connect through the gateway-proxy on fly.io.
  *
- * Connects to wss://discord-gateway.kimaki.xyz instead of the real Discord
+ * Connects to wss://discord-gateway.kimaki.dev instead of the real Discord
  * gateway. Uses `ws.buildStrategy` to patch the gateway URL that discord.js
  * discovers from GET /gateway/bot — REST calls still go to real Discord.
  *
@@ -16,7 +16,7 @@
 import { Client, GatewayIntentBits } from 'discord.js'
 import { SimpleShardingStrategy } from '@discordjs/ws'
 
-const PROXY_URL = 'wss://discord-gateway.kimaki.xyz'
+const PROXY_URL = 'wss://discord-gateway.kimaki.dev'
 const DISCONNECT_AFTER_MS = 10_000
 
 const token = process.env['DISCORD_BOT_TOKEN']

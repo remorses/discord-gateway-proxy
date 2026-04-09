@@ -618,7 +618,7 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>Discord Gateway Proxy</h1>
-  <p><a href="https://kimaki.xyz">kimaki.xyz</a></p>
+  <p><a href="https://kimaki.dev">kimaki.dev</a></p>
 </div>
 </body>
 </html>"#;
