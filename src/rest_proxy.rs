@@ -137,7 +137,12 @@ fn should_attach_bot_authorization(scope: &RouteScope, has_auth_context: bool) -
 fn should_skip_request_header(name: &str) -> bool {
     matches!(
         name,
-        "authorization" | "host" | "connection" | "transfer-encoding" | "content-length"
+        "authorization"
+            | "host"
+            | "connection"
+            | "transfer-encoding"
+            | "content-length"
+            | "accept-encoding"
     )
 }
 
@@ -440,8 +445,8 @@ pub async fn handle_rest_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_route_scope, should_attach_bot_authorization, should_skip_response_header,
-        RouteScope,
+        resolve_route_scope, should_attach_bot_authorization, should_skip_request_header,
+        should_skip_response_header, RouteScope,
     };
 
     #[test]
@@ -489,5 +494,12 @@ mod tests {
         assert!(!should_skip_response_header("content-encoding"));
         assert!(should_skip_response_header("content-length"));
         assert!(should_skip_response_header("transfer-encoding"));
+    }
+
+    #[test]
+    fn skips_accept_encoding_request_header() {
+        assert!(should_skip_request_header("accept-encoding"));
+        assert!(should_skip_request_header("authorization"));
+        assert!(!should_skip_request_header("user-agent"));
     }
 }
