@@ -84,6 +84,15 @@ async function main() {
         strategy: 'immediate',
         minInstances: 1,
         maxInstances: 1,
+        // Per-machine fly proxy connection limit. The proxy holds one long-lived
+        // gateway WebSocket per kimaki user plus REST connections, all counted as
+        // open TCP connections (type: 'connections'). The deployFly default is 500
+        // (soft 350); once a single machine nears the hard limit fly refuses new
+        // connections and clients see undici "Connect Timeout Error ... 10000ms".
+        // We run a single machine on purpose (minInstances === maxInstances === 1),
+        // so raise the per-machine ceiling instead of scaling out.
+        // soft_limit is derived as floor(concurrencyLimit * 0.7) = 35000.
+        concurrencyLimit: 50000,
         regions: ['iad'],
         env: {
             ...env,
