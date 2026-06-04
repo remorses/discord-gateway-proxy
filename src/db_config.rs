@@ -26,7 +26,7 @@ use crate::config::{ClientConfig, CONFIG};
 pub static CLIENTS: LazyLock<RwLock<HashMap<String, ClientConfig>>> =
     LazyLock::new(|| RwLock::new(CONFIG.clients.clone()));
 
-const CLIENT_DATA_STALE_AFTER_SECS: u64 = 30;
+const CLIENT_DATA_STALE_AFTER_SECS: u64 = 120;
 const DIRTY_FLUSH_INTERVAL_MS: u64 = 100;
 const FULL_RECONCILE_INTERVAL_SECS: u64 = 60;
 const DB_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
