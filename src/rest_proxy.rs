@@ -302,14 +302,26 @@ pub async fn handle_rest_request(
     let auth_context = if matches!(scope, RouteScope::AllowedWithoutAuth) {
         None
     } else {
-        let Some(auth_context) = auth::authenticate_gateway_token(auth_header) else {
-            warn!(
-                "REST auth rejected: missing or invalid credentials: path={}",
-                normalized_path
-            );
-            return json_error(StatusCode::UNAUTHORIZED, "Invalid or missing credentials");
-        };
-        Some(auth_context)
+        match auth::authenticate_gateway_token(auth_header) {
+            auth::GatewayAuthResult::Ok(ctx) => Some(ctx),
+            auth::GatewayAuthResult::Stale => {
+                warn!(
+                    "REST auth rejected (stale backend): path={}",
+                    normalized_path
+                );
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Auth backend temporarily unavailable",
+                );
+            }
+            auth::GatewayAuthResult::Invalid => {
+                warn!(
+                    "REST auth rejected: missing or invalid credentials: path={}",
+                    normalized_path
+                );
+                return json_error(StatusCode::UNAUTHORIZED, "Invalid or missing credentials");
+            }
+        }
     };
 
     if let Some(auth_context) = auth_context.as_ref() {

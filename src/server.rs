@@ -385,9 +385,16 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                 }
 
                 let client_token = auth::normalize_gateway_token(&identify.d.token);
-                let Some(auth) = auth::authenticate_gateway_token(client_token) else {
-                    warn!("[{addr}] Token from client mismatched and not a valid client, disconnecting");
-                    break;
+                let auth = match auth::authenticate_gateway_token(client_token) {
+                    auth::GatewayAuthResult::Ok(ctx) => ctx,
+                    auth::GatewayAuthResult::Stale => {
+                        warn!("[{addr}] Auth backend stale, disconnecting");
+                        break;
+                    }
+                    auth::GatewayAuthResult::Invalid => {
+                        warn!("[{addr}] Token from client mismatched and not a valid client, disconnecting");
+                        break;
+                    }
                 };
 
                 if matches!(auth.principal, SessionPrincipal::Client(_)) {
@@ -453,9 +460,16 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                 };
 
                 let client_token = auth::normalize_gateway_token(&resume.d.token);
-                let Some(resume_auth) = auth::authenticate_gateway_token(client_token) else {
-                    warn!("[{addr}] Token from client mismatched, disconnecting");
-                    break;
+                let resume_auth = match auth::authenticate_gateway_token(client_token) {
+                    auth::GatewayAuthResult::Ok(ctx) => ctx,
+                    auth::GatewayAuthResult::Stale => {
+                        warn!("[{addr}] Auth backend stale during RESUME, disconnecting");
+                        break;
+                    }
+                    auth::GatewayAuthResult::Invalid => {
+                        warn!("[{addr}] Token from client mismatched, disconnecting");
+                        break;
+                    }
                 };
 
                 // Find the shard that has the matching session ID

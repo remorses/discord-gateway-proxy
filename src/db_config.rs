@@ -74,25 +74,41 @@ fn should_reject_stale_client_data() -> bool {
     now_secs.saturating_sub(last_success) > CLIENT_DATA_STALE_AFTER_SECS
 }
 
+/// Result of a client authentication attempt.
+pub enum ClientAuthResult {
+    /// Authentication succeeded.
+    Ok(String, HashSet<u64>),
+    /// Auth backend (database) is stale/unavailable — caller should treat as
+    /// transient failure (503), not invalid credentials (401).
+    Stale,
+    /// Credentials are missing, malformed, or wrong.
+    Invalid,
+}
+
 /// Authenticate a WebSocket client by "client_id:secret" token.
-/// Returns the client ID and the set of authorized guild IDs if authentication succeeds.
-pub fn authenticate_client_with_id(token: &str) -> Option<(String, HashSet<u64>)> {
+pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
     if should_reject_stale_client_data() {
         warn!(
             "Rejecting client authentication because database client data is stale (> {}s)",
             CLIENT_DATA_STALE_AFTER_SECS
         );
-        return None;
+        return ClientAuthResult::Stale;
     }
 
-    let (client_id, secret) = token.split_once(':')?;
-    let clients = CLIENTS.read().ok()?;
-    let client = clients.get(client_id)?;
+    let Some((client_id, secret)) = token.split_once(':') else {
+        return ClientAuthResult::Invalid;
+    };
+    let Ok(clients) = CLIENTS.read() else {
+        return ClientAuthResult::Invalid;
+    };
+    let Some(client) = clients.get(client_id) else {
+        return ClientAuthResult::Invalid;
+    };
 
     if client.secret == secret {
-        Some((client_id.to_string(), client.guilds.clone()))
+        ClientAuthResult::Ok(client_id.to_string(), client.guilds.clone())
     } else {
-        None
+        ClientAuthResult::Invalid
     }
 }
 
