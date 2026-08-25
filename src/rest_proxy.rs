@@ -70,11 +70,11 @@ fn resolve_route_scope(path: &str) -> RouteScope {
 
     let route = &segments[base_index..];
 
-    if route.len() >= 2 && route[0] == "gateway" && route[1] == "bot" {
+    if route.len() == 2 && route[0] == "gateway" && route[1] == "bot" {
         return RouteScope::AllowedWithoutGuild;
     }
 
-    if route.len() >= 2
+    if route.len() == 2
         && route[0] == "users"
         && (route[1] == "@me" || route[1].eq_ignore_ascii_case("%40me"))
     {
@@ -481,6 +481,22 @@ mod tests {
         ));
         assert!(matches!(
             resolve_route_scope("/api/v10/interactions/123456789"),
+            RouteScope::DeniedWithoutGuild
+        ));
+    }
+
+    #[test]
+    fn allows_only_exact_global_bot_routes() {
+        assert!(matches!(
+            resolve_route_scope("/api/v10/users/@me"),
+            RouteScope::AllowedWithoutGuild
+        ));
+        assert!(matches!(
+            resolve_route_scope("/api/v10/users/@me/guilds"),
+            RouteScope::DeniedWithoutGuild
+        ));
+        assert!(matches!(
+            resolve_route_scope("/api/v10/gateway/bot/extra"),
             RouteScope::DeniedWithoutGuild
         ));
     }

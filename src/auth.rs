@@ -23,6 +23,13 @@ pub enum GatewayAuthResult {
 }
 
 pub fn authenticate_gateway_token(token: &str) -> GatewayAuthResult {
+    if token == CONFIG.token {
+        return GatewayAuthResult::Ok(AuthContext {
+            principal: SessionPrincipal::BotToken,
+            authorized_guilds: None,
+        });
+    }
+
     match db_config::authenticate_client_with_id(token) {
         db_config::ClientAuthResult::Ok(client_id, guilds) => {
             return GatewayAuthResult::Ok(AuthContext {
@@ -34,13 +41,6 @@ pub fn authenticate_gateway_token(token: &str) -> GatewayAuthResult {
             return GatewayAuthResult::Stale;
         }
         db_config::ClientAuthResult::Invalid => {}
-    }
-
-    if token == CONFIG.token {
-        return GatewayAuthResult::Ok(AuthContext {
-            principal: SessionPrincipal::BotToken,
-            authorized_guilds: None,
-        });
     }
 
     if CONFIG.validate_token {

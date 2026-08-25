@@ -53,24 +53,27 @@ fn mark_sync_success() {
 }
 
 fn should_reject_stale_client_data() -> bool {
-    if std::env::var("DIRECT_DATABASE_URL")
+    let database_configured = std::env::var("DIRECT_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .is_err()
-    {
-        return false;
-    }
-
+        .is_ok();
     let last_success = LAST_SUCCESSFUL_SYNC_UNIX_SECS.load(Ordering::Relaxed);
-    if last_success == 0 {
-        // Database sync is configured but has not succeeded yet.
-        // Keep startup compatibility with config-seeded clients.
+    should_reject_client_data(database_configured, last_success, unix_now_secs())
+}
+
+fn should_reject_client_data(
+    database_configured: bool,
+    last_success: u64,
+    now_secs: Option<u64>,
+) -> bool {
+    if !database_configured {
         return false;
     }
-
-    let Some(now_secs) = unix_now_secs() else {
-        return false;
+    if last_success == 0 {
+        return true;
+    }
+    let Some(now_secs) = now_secs else {
+        return true;
     };
-
     now_secs.saturating_sub(last_success) > CLIENT_DATA_STALE_AFTER_SECS
 }
 
@@ -87,6 +90,9 @@ pub enum ClientAuthResult {
 
 /// Authenticate a WebSocket client by "client_id:secret" token.
 pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
+    let Some((client_id, secret)) = token.split_once(':') else {
+        return ClientAuthResult::Invalid;
+    };
     if should_reject_stale_client_data() {
         warn!(
             "Rejecting client authentication because database client data is stale (> {}s)",
@@ -95,9 +101,6 @@ pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
         return ClientAuthResult::Stale;
     }
 
-    let Some((client_id, secret)) = token.split_once(':') else {
-        return ClientAuthResult::Invalid;
-    };
     let Ok(clients) = CLIENTS.read() else {
         return ClientAuthResult::Invalid;
     };
@@ -594,7 +597,16 @@ fn group_rows_into_clients(rows: Vec<SnapshotClientRow>) -> HashMap<String, Clie
 
 #[cfg(test)]
 mod tests {
-    use super::{group_rows_into_clients, SnapshotClientRow};
+    use super::{group_rows_into_clients, should_reject_client_data, SnapshotClientRow};
+
+    #[test]
+    fn database_client_auth_fails_closed_until_sync_is_fresh() {
+        assert!(!should_reject_client_data(false, 0, None));
+        assert!(should_reject_client_data(true, 0, Some(100)));
+        assert!(should_reject_client_data(true, 100, None));
+        assert!(!should_reject_client_data(true, 100, Some(220)));
+        assert!(should_reject_client_data(true, 100, Some(221)));
+    }
 
     #[test]
     fn conflicting_secrets_keep_newest_row_and_skip_stale_guilds() {
