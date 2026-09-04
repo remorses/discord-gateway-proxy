@@ -30,15 +30,79 @@ enum RouteScope {
     DeniedWithoutGuild,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelGuildLookup {
+    Found(u64),
+    UnknownChannel,
+    MissingGuild,
+    LookupFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelScopeDecision {
+    Allow,
+    UnknownChannel,
+    LookupFailed,
+    Forbidden { guild_id: Option<u64> },
+}
+
 fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     let payload = format!(r#"{{"error":"{}"}}"#, message.replace('"', "\\\""));
-    let mut response = Response::new(Full::from(Bytes::from(payload)));
+    json_response(status, payload)
+}
+
+fn json_response(status: StatusCode, payload: impl Into<Bytes>) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::from(payload.into()));
     *response.status_mut() = status;
     response.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
         hyper::header::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+fn unknown_channel_error() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(br#"{"message":"Unknown Channel","code":10003}"#),
+    )
+}
+
+fn response_for_channel_scope(
+    channel_id: u64,
+    lookup: ChannelGuildLookup,
+    authorized_guilds: &HashSet<u64>,
+) -> Option<Response<Full<Bytes>>> {
+    match channel_scope_decision(&lookup, authorized_guilds) {
+        ChannelScopeDecision::Allow => None,
+        ChannelScopeDecision::UnknownChannel => {
+            warn!(
+                "REST channel not found: channel_id={}, lookup={:?}",
+                channel_id, lookup
+            );
+            Some(unknown_channel_error())
+        }
+        ChannelScopeDecision::LookupFailed => {
+            warn!(
+                "REST channel lookup failed: channel_id={}, lookup={:?}",
+                channel_id, lookup
+            );
+            Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                "Failed to resolve channel guild scope",
+            ))
+        }
+        ChannelScopeDecision::Forbidden { guild_id } => {
+            warn!(
+                "REST auth rejected channel scope: channel_id={}, resolved_guild_id={:?}",
+                channel_id, guild_id
+            );
+            Some(json_error(
+                StatusCode::FORBIDDEN,
+                "REST route is outside the authorized guild scope",
+            ))
+        }
+    }
 }
 
 fn parse_snowflake(value: &str) -> Option<u64> {
@@ -171,9 +235,7 @@ fn parse_guild_id_from_channel_payload(raw_payload: &[u8]) -> Option<u64> {
         return None;
     };
 
-    let guild_value = object.get("guild_id")?;
-    let guild_id = guild_value.as_str()?;
-    parse_snowflake(guild_id)
+    parse_guild_id_value(object.get("guild_id")?)
 }
 
 #[cfg(not(feature = "simd-json"))]
@@ -183,35 +245,99 @@ fn parse_guild_id_from_channel_payload(raw_payload: &[u8]) -> Option<u64> {
         return None;
     };
 
-    let guild_value = object.get("guild_id")?;
-    let guild_id = guild_value.as_str()?;
-    parse_snowflake(guild_id)
+    parse_guild_id_value(object.get("guild_id")?)
 }
 
-async fn lookup_channel_guild_id(channel_id: u64) -> Option<u64> {
+fn parse_guild_id_value(guild_value: &JsonValue) -> Option<u64> {
+    if let Some(guild_id) = guild_value.as_str() {
+        return parse_snowflake(guild_id);
+    }
+
+    guild_value.as_u64()
+}
+
+// Discord 404/10003 must stay 404. Remapping it to 403 made `kimaki project list --prune` keep stale rows.
+fn classify_channel_lookup_response(status: u16, raw_payload: &[u8]) -> ChannelGuildLookup {
+    if status == 404 {
+        return ChannelGuildLookup::UnknownChannel;
+    }
+    if !(200..300).contains(&status) {
+        return ChannelGuildLookup::LookupFailed;
+    }
+
+    match parse_guild_id_from_channel_payload(raw_payload) {
+        Some(guild_id) => ChannelGuildLookup::Found(guild_id),
+        None => ChannelGuildLookup::MissingGuild,
+    }
+}
+
+fn channel_scope_decision(
+    lookup: &ChannelGuildLookup,
+    authorized_guilds: &HashSet<u64>,
+) -> ChannelScopeDecision {
+    match lookup {
+        ChannelGuildLookup::Found(guild_id) if authorized_guilds.contains(guild_id) => {
+            ChannelScopeDecision::Allow
+        }
+        ChannelGuildLookup::Found(guild_id) => ChannelScopeDecision::Forbidden {
+            guild_id: Some(*guild_id),
+        },
+        ChannelGuildLookup::UnknownChannel => ChannelScopeDecision::UnknownChannel,
+        ChannelGuildLookup::MissingGuild => ChannelScopeDecision::Forbidden { guild_id: None },
+        ChannelGuildLookup::LookupFailed => ChannelScopeDecision::LookupFailed,
+    }
+}
+
+async fn lookup_channel_guild_id(channel_id: u64) -> ChannelGuildLookup {
     let channel_url = format!(
         "{}/api/v10/channels/{}",
         discord_rest_base_url(),
         channel_id
     );
 
-    let response = HTTP_CLIENT
+    let response = match HTTP_CLIENT
         .get(channel_url)
         .header(AUTHORIZATION.as_str(), format!("Bot {}", CONFIG.token))
         .send()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(
+                "REST channel lookup request failed: channel_id={}, error={}",
+                channel_id, error
+            );
+            return ChannelGuildLookup::LookupFailed;
+        }
+    };
 
-    let body = response.bytes().await.ok()?;
-    parse_guild_id_from_channel_payload(&body)
+    let status = response.status().as_u16();
+    let body = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                "REST channel lookup failed to read body: channel_id={}, error={}",
+                channel_id, error
+            );
+            return ChannelGuildLookup::LookupFailed;
+        }
+    };
+
+    let lookup = classify_channel_lookup_response(status, &body);
+    if !matches!(lookup, ChannelGuildLookup::Found(_)) {
+        let preview_bytes = &body[..body.len().min(200)];
+        let body_preview = String::from_utf8_lossy(preview_bytes);
+        warn!(
+            "REST channel lookup did not resolve guild: channel_id={}, status={}, lookup={:?}, body={}",
+            channel_id, status, lookup, body_preview
+        );
+    }
+    lookup
 }
 
-async fn resolve_channel_guild_id(channel_id: u64, state: &State) -> Option<u64> {
+async fn resolve_channel_guild_id(channel_id: u64, state: &State) -> ChannelGuildLookup {
     if let Some(guild_id) = state.resolve_guild_id_for_channel(channel_id) {
-        return Some(guild_id);
+        return ChannelGuildLookup::Found(guild_id);
     }
 
     lookup_channel_guild_id(channel_id).await
@@ -339,19 +465,11 @@ pub async fn handle_rest_request(
                     return json_error(StatusCode::FORBIDDEN, "Channel route authorization failed");
                 };
 
-                let guild_id = resolve_channel_guild_id(channel_id, &state).await;
-                let is_authorized = guild_id
-                    .map(|resolved_guild_id| authorized_guilds.contains(&resolved_guild_id))
-                    .unwrap_or(false);
-                if !is_authorized {
-                    warn!(
-                        "REST auth rejected channel scope: channel_id={}, resolved_guild_id={:?}",
-                        channel_id, guild_id
-                    );
-                    return json_error(
-                        StatusCode::FORBIDDEN,
-                        "REST route is outside the authorized guild scope",
-                    );
+                let lookup = resolve_channel_guild_id(channel_id, &state).await;
+                if let Some(error) =
+                    response_for_channel_scope(channel_id, lookup, authorized_guilds)
+                {
+                    return error;
                 }
             } else if !is_client_authorized_for_route(authorized_guilds, &scope) {
                 warn!(
@@ -457,9 +575,11 @@ pub async fn handle_rest_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_route_scope, should_attach_bot_authorization, should_skip_request_header,
-        should_skip_response_header, RouteScope,
+        channel_scope_decision, classify_channel_lookup_response, resolve_route_scope,
+        should_attach_bot_authorization, should_skip_request_header, should_skip_response_header,
+        ChannelGuildLookup, ChannelScopeDecision, RouteScope,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn resolves_tokenized_routes_as_allowed_without_auth() {
@@ -513,5 +633,72 @@ mod tests {
         assert!(should_skip_request_header("accept-encoding"));
         assert!(should_skip_request_header("authorization"));
         assert!(!should_skip_request_header("user-agent"));
+    }
+
+    #[test]
+    fn classifies_discord_unknown_channel_as_not_found() {
+        assert_eq!(
+            classify_channel_lookup_response(404, br#"{"message":"Unknown Channel","code":10003}"#,),
+            ChannelGuildLookup::UnknownChannel
+        );
+    }
+
+    #[test]
+    fn classifies_channel_payload_guild_id_as_found() {
+        assert_eq!(
+            classify_channel_lookup_response(
+                200,
+                br#"{"id":"1","type":0,"guild_id":"1422625037164351591","name":"kimakivoice"}"#,
+            ),
+            ChannelGuildLookup::Found(1_422_625_037_164_351_591)
+        );
+    }
+
+    #[test]
+    fn classifies_dm_channel_payload_as_missing_guild() {
+        assert_eq!(
+            classify_channel_lookup_response(200, br#"{"id":"1","type":1}"#),
+            ChannelGuildLookup::MissingGuild
+        );
+    }
+
+    #[test]
+    fn classifies_non_404_lookup_failures_as_lookup_failed() {
+        assert_eq!(
+            classify_channel_lookup_response(500, br#"{"message":"internal"}"#),
+            ChannelGuildLookup::LookupFailed
+        );
+        assert_eq!(
+            classify_channel_lookup_response(403, br#"{"message":"Missing Access","code":50001}"#),
+            ChannelGuildLookup::LookupFailed
+        );
+    }
+
+    #[test]
+    fn allows_channel_only_when_resolved_guild_is_authorized() {
+        let authorized = HashSet::from([1_422_625_037_164_351_591]);
+        assert_eq!(
+            channel_scope_decision(
+                &ChannelGuildLookup::Found(1_422_625_037_164_351_591),
+                &authorized,
+            ),
+            ChannelScopeDecision::Allow
+        );
+        assert_eq!(
+            channel_scope_decision(&ChannelGuildLookup::Found(99), &authorized),
+            ChannelScopeDecision::Forbidden { guild_id: Some(99) }
+        );
+        assert_eq!(
+            channel_scope_decision(&ChannelGuildLookup::UnknownChannel, &authorized),
+            ChannelScopeDecision::UnknownChannel
+        );
+        assert_eq!(
+            channel_scope_decision(&ChannelGuildLookup::MissingGuild, &authorized),
+            ChannelScopeDecision::Forbidden { guild_id: None }
+        );
+        assert_eq!(
+            channel_scope_decision(&ChannelGuildLookup::LookupFailed, &authorized),
+            ChannelScopeDecision::LookupFailed
+        );
     }
 }

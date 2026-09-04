@@ -24,6 +24,10 @@ resources outside its authorized guilds.
 - never allow `/webhooks/{id}` as an unscoped allowlist route.
 - for `AllowedWithoutAuth`, do not inject bot `Authorization` when forwarding.
 - if route scope cannot be proven, fail closed.
+- if Discord says the channel is unknown (`404` / code `10003`), return that
+  Discord 404. Do not remap it to `403`. `kimaki project list --prune` treats
+  404 as deleted and 403 as a permission error. Keep `403` only when the
+  guild is known and not authorized. Use `502` for lookup transport failures.
 
 # split with website
 
