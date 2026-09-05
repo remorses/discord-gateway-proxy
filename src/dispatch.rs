@@ -153,7 +153,7 @@ pub async fn events(
             continue;
         };
 
-        let (op, sequence, event_type, guild_id) = event.into_parts();
+        let (op, sequence, event_type, guild_id, channel_id) = event.into_parts();
 
         if let Some(EventTypeInfo(event_name, _)) = event_type {
             metrics::counter!("gateway_shard_events", "shard" => shard_id_str.clone(), "event_type" => event_name.to_owned()).increment(1);
@@ -202,6 +202,11 @@ pub async fn events(
                         guild_id,
                     );
                 }
+                if wake::should_show_wake_typing(event_name) {
+                    if let (Some(channel_id), Some(guild_id)) = (channel_id, guild_id) {
+                        start_wake_typing_for_disconnected_clients(&state, guild_id, channel_id);
+                    }
+                }
             }
         }
 
@@ -226,6 +231,38 @@ pub async fn events(
                 tracing::warn!("[Shard {shard_id}] Failed to parse gateway event: {e:?}");
             }
         }
+    }
+}
+
+fn start_wake_typing_for_disconnected_clients(state: &State, guild_id: u64, channel_id: u64) {
+    let client_ids: Vec<String> = CLIENTS
+        .read()
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|(client_id, config)| {
+                    if !config.guilds.contains(&guild_id) {
+                        return None;
+                    }
+                    if state.is_client_connected(client_id) {
+                        return None;
+                    }
+                    if config.reachable_url.is_none() {
+                        return None;
+                    }
+                    Some(client_id.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if client_ids.is_empty() {
+        return;
+    }
+
+    let http = wake::discord_http_client();
+    for client_id in client_ids {
+        wake::spawn_wake_typing(http.clone(), state.clone(), client_id, channel_id);
     }
 }
 

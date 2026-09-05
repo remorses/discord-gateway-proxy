@@ -112,9 +112,9 @@ pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
     }
 }
 
-const SELECT_CLIENTS_SQL: &str = "SELECT client_id, secret, guild_id, reachable_url FROM gateway_clients ORDER BY client_id ASC, updated_at DESC NULLS LAST, created_at DESC";
+const SELECT_CLIENTS_SQL: &str = "SELECT client_id, secret, guild_id, reachable_url, next_wake_at FROM gateway_clients ORDER BY client_id ASC, updated_at DESC NULLS LAST, created_at DESC";
 const SELECT_CLIENTS_BY_IDS_SQL: &str =
-    "SELECT client_id, secret, guild_id, reachable_url FROM gateway_clients WHERE client_id = ANY($1::text[]) ORDER BY client_id ASC, updated_at DESC NULLS LAST, created_at DESC";
+    "SELECT client_id, secret, guild_id, reachable_url, next_wake_at FROM gateway_clients WHERE client_id = ANY($1::text[]) ORDER BY client_id ASC, updated_at DESC NULLS LAST, created_at DESC";
 const CREATE_NOTIFY_FUNCTION_SQL: &str = "\
 CREATE OR REPLACE FUNCTION notify_gateway_clients_change()
 RETURNS trigger
@@ -535,6 +535,7 @@ struct SnapshotClientRow {
     secret: String,
     guild_id: String,
     reachable_url: Option<String>,
+    next_wake_at: Option<std::time::SystemTime>,
 }
 
 fn snapshot_client_row_from_row(row: tokio_postgres::Row) -> SnapshotClientRow {
@@ -543,6 +544,17 @@ fn snapshot_client_row_from_row(row: tokio_postgres::Row) -> SnapshotClientRow {
         secret: row.get(1),
         guild_id: row.get(2),
         reachable_url: row.get(3),
+        next_wake_at: row.get(4),
+    }
+}
+
+fn earliest_wake(
+    current: Option<std::time::SystemTime>,
+    candidate: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    match (current, candidate) {
+        (None, other) | (other, None) => other,
+        (Some(left), Some(right)) => Some(left.min(right)),
     }
 }
 
@@ -554,6 +566,7 @@ fn group_rows_into_clients(rows: Vec<SnapshotClientRow>) -> HashMap<String, Clie
         let secret = row.secret;
         let guild_id_str = row.guild_id;
         let reachable_url = row.reachable_url;
+        let next_wake_at = row.next_wake_at;
 
         let guild_id: u64 = match guild_id_str.parse() {
             Ok(id) => id,
@@ -577,6 +590,7 @@ fn group_rows_into_clients(rows: Vec<SnapshotClientRow>) -> HashMap<String, Clie
                 if c.reachable_url.is_none() && reachable_url.is_some() {
                     c.reachable_url = reachable_url.clone();
                 }
+                c.next_wake_at = earliest_wake(c.next_wake_at, next_wake_at);
             })
             .or_insert_with(|| {
                 let mut guilds = HashSet::new();
@@ -585,6 +599,7 @@ fn group_rows_into_clients(rows: Vec<SnapshotClientRow>) -> HashMap<String, Clie
                     secret,
                     guilds,
                     reachable_url,
+                    next_wake_at,
                 }
             });
     }
@@ -604,18 +619,21 @@ mod tests {
                 secret: String::from("new-secret"),
                 guild_id: String::from("111"),
                 reachable_url: Some(String::from("https://client.example")),
+                next_wake_at: None,
             },
             SnapshotClientRow {
                 client_id: String::from("client-1"),
                 secret: String::from("old-secret"),
                 guild_id: String::from("222"),
                 reachable_url: Some(String::from("https://stale.example")),
+                next_wake_at: None,
             },
             SnapshotClientRow {
                 client_id: String::from("client-1"),
                 secret: String::from("new-secret"),
                 guild_id: String::from("333"),
                 reachable_url: None,
+                next_wake_at: None,
             },
         ]);
 

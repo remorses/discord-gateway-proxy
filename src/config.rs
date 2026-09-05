@@ -38,6 +38,10 @@ pub struct ClientConfig {
     /// Used for cloud-deployed kimaki instances that are internet-reachable.
     #[serde(default)]
     pub reachable_url: Option<String>,
+    /// Soonest local task/sleep on the cloud machine. Set from PlanetScale.
+    /// JSON config does not carry this; the DB poller fills it in.
+    #[serde(default, skip_deserializing)]
+    pub next_wake_at: Option<std::time::SystemTime>,
 }
 
 /// Custom deserializer to handle guild IDs as either strings or numbers

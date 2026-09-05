@@ -253,6 +253,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
+    wake::spawn_scheduled_wakes(state.clone());
+
     let state_clone = state.clone();
     tokio::spawn(async move {
         if let Err(e) = server::run(CONFIG.port, state_clone, metrics_handle).await {

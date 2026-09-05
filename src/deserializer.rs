@@ -23,6 +23,7 @@ pub struct GatewayEvent<'a> {
     op: OpInfo,
     sequence: Option<SequenceInfo>,
     guild_id: Option<u64>,
+    channel_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,12 +47,14 @@ impl<'a> GatewayEvent<'a> {
         let event_type = Self::find_event_type(input);
         let sequence = Self::find_sequence(input);
         let guild_id = Self::find_guild_id(input, event_type.as_ref());
+        let channel_id = Self::find_channel_id(input, event_type.as_ref());
 
         Some(Self {
             event_type,
             op,
             sequence,
             guild_id,
+            channel_id,
         })
     }
 
@@ -75,8 +78,15 @@ impl<'a> GatewayEvent<'a> {
         Option<SequenceInfo>,
         Option<EventTypeInfo<'a>>,
         Option<u64>,
+        Option<u64>,
     ) {
-        (self.op, self.sequence, self.event_type, self.guild_id)
+        (
+            self.op,
+            self.sequence,
+            self.event_type,
+            self.guild_id,
+            self.channel_id,
+        )
     }
 
     fn find_event_type(input: &'a str) -> Option<EventTypeInfo<'a>> {
@@ -183,5 +193,44 @@ impl<'a> GatewayEvent<'a> {
         }
 
         None
+    }
+
+    fn find_channel_id(input: &'a str, event_type: Option<&EventTypeInfo<'_>>) -> Option<u64> {
+        if let Some(channel_id) = Self::find_data_field_u64(input, "channel_id") {
+            return Some(channel_id);
+        }
+
+        let Some(event_type_info) = event_type else {
+            return None;
+        };
+
+        if matches!(
+            event_type_info.0,
+            "CHANNEL_CREATE"
+                | "CHANNEL_UPDATE"
+                | "CHANNEL_DELETE"
+                | "THREAD_CREATE"
+                | "THREAD_UPDATE"
+                | "THREAD_DELETE"
+        ) {
+            return Self::find_data_field_u64(input, "id");
+        }
+
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GatewayEvent;
+
+    #[test]
+    fn finds_channel_id_on_message_create() {
+        let payload = r#"{"t":"MESSAGE_CREATE","s":1,"op":0,"d":{"id":"9","channel_id":"1545800148565758123","guild_id":"1422625037164351591","content":"hi"}}"#;
+        let event = GatewayEvent::from_json(payload).expect("event");
+        let (_op, _seq, event_type, guild_id, channel_id) = event.into_parts();
+        assert_eq!(event_type.map(|info| info.0), Some("MESSAGE_CREATE"));
+        assert_eq!(guild_id, Some(1_422_625_037_164_351_591));
+        assert_eq!(channel_id, Some(1_545_800_148_565_758_123));
     }
 }
