@@ -1,12 +1,16 @@
-// Voice through the real Rust proxy. The digital Discord twin plays Discord
-// (gateway, REST, voice WebSocket and UDP); the proxy runs as a child process
-// with three multi-tenant clients; discord.js + @discordjs/voice play a TTS
-// clip. Checks the owner lock, that only the owner gets the voice token, and
-// that the audio reaches the voice server byte for byte. The received audio
-// is decoded to tmp/voice/received.wav (gitignored) so you can listen to it.
+// The real Rust proxy against the digital Discord twin, which plays Discord
+// (gateway, REST, voice WebSocket and UDP). The proxy runs as a child process
+// with three multi-tenant clients.
+// Voice: discord.js + @discordjs/voice play a TTS clip. Checks the owner lock,
+// that only the owner gets the voice token, and that the audio reaches the
+// voice server byte for byte. The received audio is decoded to
+// tmp/voice/received.wav (gitignored) so you can listen to it.
+// Security: attacker requests at the transport level (raw WebSocket frames,
+// raw HTTP paths that fetch() would normalize).
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import net from 'node:net'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -283,3 +287,59 @@ test('a fresh IDENTIFY ends the old call so the same join works again', async ()
   await entersState(join({ client: second.client, guildId: GUILD, channelId: VOICE_1 }), VoiceConnectionStatus.Ready, 8_000)
   expect(botChannel(second.client)).toBe(VOICE_1)
 }, 30_000)
+
+// Raw request: node:http sends the path as written, fetch() would normalize it.
+function rawRequest({ method = 'GET', path: requestPath, token }: { method?: string; path: string; token: string }): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      { host: '127.0.0.1', port: proxyPort, method, path: requestPath, headers: { authorization: `Bot ${token}` } },
+      (response) => {
+        response.resume()
+        resolve(response.statusCode ?? 0)
+      },
+    )
+    request.on('error', reject)
+    request.end()
+  })
+}
+
+async function proxyAlive(): Promise<boolean> {
+  const status = await fetch(`http://127.0.0.1:${proxyPort}/shard-count`)
+    .then((response) => response.status)
+    .catch(() => 0)
+  return status === 200 && proxy.exitCode === null
+}
+
+test('a binary or oversized frame before IDENTIFY does not take the proxy down', async () => {
+  for (const frame of [new Uint8Array([1, 2]), 'x'.repeat(20_000)]) {
+    const socket = new WebSocket(`ws://127.0.0.1:${proxyPort}`)
+    await new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }))
+    const closed = new Promise((resolve) => socket.addEventListener('close', resolve, { once: true }))
+    socket.send(frame)
+    if (typeof frame === 'string') await closed
+    else socket.close()
+  }
+  expect(await proxyAlive()).toBe(true)
+})
+
+test('REST: global bot routes are exact and read-only, dot segments are rejected', async () => {
+  expect({
+    usersMe: await rawRequest({ path: '/api/v10/users/@me', token: ALPHA }),
+    patchUsersMe: await rawRequest({ method: 'PATCH', path: '/api/v10/users/@me', token: ALPHA }),
+    botGuilds: await rawRequest({ path: '/api/v10/users/@me/guilds', token: ALPHA }),
+    leaveGuild: await rawRequest({ method: 'DELETE', path: `/api/v10/users/@me/guilds/${OTHER_GUILD}`, token: ALPHA }),
+    traversal: await rawRequest({ path: `/api/v10/guilds/${GUILD}/%2e%2e/%2e%2e/users/@me/guilds`, token: ALPHA }),
+    plainTraversal: await rawRequest({ path: `/api/v10/guilds/${GUILD}/../${OTHER_GUILD}/channels`, token: ALPHA }),
+    ownGuild: await rawRequest({ path: `/api/v10/guilds/${GUILD}/channels`, token: ALPHA }),
+  }).toMatchInlineSnapshot(`
+    {
+      "botGuilds": 403,
+      "leaveGuild": 403,
+      "ownGuild": 200,
+      "patchUsersMe": 403,
+      "plainTraversal": 400,
+      "traversal": 400,
+      "usersMe": 200,
+    }
+  `)
+})

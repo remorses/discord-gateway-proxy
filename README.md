@@ -151,7 +151,11 @@ For multi-tenant client credentials, REST requests are guild-scoped:
 
 - Routes with `guild_id` are allowed only when that guild is in the client's authorized guild set.
 - Channel routes are resolved to a guild via the proxy cache and filtered the same way.
-- Routes without a resolvable guild context are denied unless they are explicitly required for client operation (for example `/api/v10/gateway/bot`).
+- Routes without a resolvable guild context are denied, except exactly `GET /api/v10/gateway/bot` and `GET /api/v10/users/@me`. Nothing under `/users/@me/*` passes: it reaches every guild of the shared bot.
+- Paths with dot segments (`..`, `%2e%2e`), encoded slashes or empty segments get 400, because the upstream client would rewrite them after the scope check.
+- Bodies are limited to about 100 MiB.
+
+Gateway connections are limited too: client messages up to 8 KiB, one IDENTIFY or RESUME per connection, and a client that reads nothing for 30s is disconnected. Guild events are filtered with the client's current guilds, so a revoked guild stops at once.
 
 `GET /api/v10/gateway/bot` rewrites the returned `url` field to the proxy's configured external URL so clients auto-discover the gateway proxy.
 
@@ -252,10 +256,10 @@ Another client gets the guild only when the owner gave it up **and** the bot is 
 
 The proxy never caches voice tokens, so every join is a real one. Enable the `voice_states` cache: `GUILD_CREATE` then shows where the bot is, and without it a leave that gets no event keeps the guild locked.
 
-`tests/voice.e2e.test.ts` runs the real proxy against [discord-digital-twin](../discord-digital-twin) with voice enabled: three clients, a TTS clip played with `@discordjs/voice`, and checks the owner lock, token routing and the received opus frames. It writes the received audio to `tmp/voice/received.wav`.
+`tests/proxy.e2e.test.ts` runs the real proxy against [discord-digital-twin](../discord-digital-twin) with voice enabled: three clients, a TTS clip played with `@discordjs/voice`, and checks the owner lock, token routing and the received opus frames. It writes the received audio to `tmp/voice/received.wav`.
 
 ```bash
-pnpm exec vitest run tests/voice.e2e.test.ts
+pnpm exec vitest run tests/proxy.e2e.test.ts
 ```
 
 ## Caveats

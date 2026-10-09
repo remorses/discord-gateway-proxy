@@ -171,6 +171,26 @@ impl ZlibState {
     }
 }
 
+/// A client that reads nothing for this long is disconnected, so its queue
+/// of pending events cannot grow without bound.
+const SINK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest message a client may send. Discord itself rejects client
+/// payloads over 4096 bytes.
+const MAX_CLIENT_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// Returns false when the client did not take the message within
+/// `SINK_SEND_TIMEOUT`.
+async fn send_in_time<S>(addr: SocketAddr, sink: &mut S, message: Message) -> Result<bool, Error>
+where
+    S: Sink<Message, Error = Error> + Unpin,
+{
+    if let Ok(result) = tokio::time::timeout(SINK_SEND_TIMEOUT, sink.send(message)).await {
+        return result.map(|()| true);
+    }
+    warn!("[{addr}] Client stopped reading for {SINK_SEND_TIMEOUT:?}, disconnecting");
+    Ok(false)
+}
+
 async fn sink_from_queue<S>(
     addr: SocketAddr,
     mut use_zlib: bool,
@@ -191,9 +211,11 @@ where
         let state = zlib.get_or_insert_with(ZlibState::new);
         let compressed = state.compress_and_send(HELLO.as_bytes());
 
-        sink.send(Message::binary(compressed)).await?;
-    } else {
-        sink.send(Message::text(HELLO.to_string())).await?;
+        if !send_in_time(addr, &mut sink, Message::binary(compressed)).await? {
+            return Ok(());
+        }
+    } else if !send_in_time(addr, &mut sink, Message::text(HELLO.to_string())).await? {
+        return Ok(());
     }
 
     // Process messages while waiting for the compression decision from
@@ -224,9 +246,11 @@ where
                         if use_zlib {
                             let state = zlib.get_or_insert_with(ZlibState::new);
                             let compressed = state.compress_and_send(&msg.into_payload());
-                            sink.send(Message::binary(compressed)).await?;
-                        } else {
-                            sink.send(msg).await?;
+                            if !send_in_time(addr, &mut sink, Message::binary(compressed)).await? {
+                                return Ok(());
+                            }
+                        } else if !send_in_time(addr, &mut sink, msg).await? {
+                            return Ok(());
                         }
                     }
                     None => return Ok(()),
@@ -242,9 +266,11 @@ where
             let state = zlib.get_or_insert_with(ZlibState::new);
             let compressed = state.compress_and_send(&msg.into_payload());
 
-            sink.send(Message::binary(compressed)).await?;
-        } else {
-            sink.send(msg).await?;
+            if !send_in_time(addr, &mut sink, Message::binary(compressed)).await? {
+                return Ok(());
+            }
+        } else if !send_in_time(addr, &mut sink, msg).await? {
+            return Ok(());
         }
     }
 
@@ -313,6 +339,14 @@ async fn forward_shard(
     let mut buffer = Buffer::new();
 
     let own_client_id = client_id.clone();
+    // Multi-tenant clients get guild events only while the guild is still
+    // authorized now, not just at IDENTIFY: a revoked guild stops at once.
+    let is_live_guild = |snapshot: &HashSet<u64>, client_id: Option<&str>, guild_id: u64| {
+        client_id.map_or_else(
+            || snapshot.contains(&guild_id),
+            |client_id| db_config::client_has_guild(client_id, guild_id),
+        )
+    };
     // Replay buffered offline events before subscribing to live stream.
     if let Some(client_id) = client_id {
         let buffered = state.drain_offline_events_for_client(&client_id);
@@ -320,7 +354,7 @@ async fn forward_shard(
             if let Some(ref guilds) = authorized_guilds {
                 match event.guild_id {
                     Some(gid) => {
-                        if !guilds.contains(&gid) {
+                        if !is_live_guild(guilds, own_client_id.as_deref(), gid) {
                             continue;
                         }
                     }
@@ -366,7 +400,7 @@ async fn forward_shard(
                 }
                 match guild_id {
                     Some(gid) => {
-                        if !guilds.contains(&gid) {
+                        if !is_live_guild(guilds, own_client_id.as_deref(), gid) {
                             // Event is for a guild this client isn't authorized for
                             continue;
                         }
@@ -408,7 +442,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     let mut shard_sender = None;
 
     let ws_conn = ServerBuilder::new()
-        .limits(Limits::unlimited())
+        .limits(Limits::unlimited().max_payload_len(Some(MAX_CLIENT_MESSAGE_BYTES)))
         .serve(stream);
 
     let (sink, mut stream) = ws_conn.split();
@@ -433,15 +467,28 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     // receive them before the connection drops.
     let mut graceful_close = false;
 
-    while let Some(Ok(msg)) = stream.next().await {
-        if !msg.is_text() && !msg.is_binary() {
+    let mut sink_done = false;
+    loop {
+        let msg = tokio::select! {
+            msg = stream.next() => msg,
+            // The sink ended: write error, or the client stopped reading.
+            _ = &mut sink_task => {
+                sink_done = true;
+                break;
+            }
+        };
+        let Some(Ok(msg)) = msg else {
+            break;
+        };
+        // Gateway clients send JSON text. Binary frames (ETF, garbage) are ignored.
+        let Some(text) = msg.as_text() else {
             continue;
-        }
+        };
 
         #[cfg(feature = "simd-json")]
-        let mut payload = unsafe { msg.as_text().unwrap_unchecked().to_owned() };
+        let mut payload = text.to_owned();
         #[cfg(not(feature = "simd-json"))]
-        let payload = unsafe { msg.as_text().unwrap_unchecked() };
+        let payload = text;
 
         let Some(deserializer) = GatewayEvent::from_json(&payload) else {
             continue;
@@ -454,6 +501,11 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
             }
             2 => {
                 debug!("[{addr}] Client is identifying");
+                // One IDENTIFY or RESUME per connection, like Discord (4005).
+                if compress_tx.is_none() {
+                    warn!("[{addr}] Client sent IDENTIFY on an authenticated connection, disconnecting");
+                    break;
+                }
 
                 #[cfg(feature = "simd-json")]
                 let maybe_identify = unsafe { simd_json::from_str(&mut payload) };
@@ -716,7 +768,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
 
     debug!("[{addr}] Client disconnected");
 
-    if graceful_close {
+    if graceful_close && !sink_done {
         // Stop the event producer first so it doesn't keep enqueuing payloads
         // through its stream_writer clone, which would delay the sink drain
         // or push the close frame further back in the queue.

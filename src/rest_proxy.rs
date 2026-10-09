@@ -1,7 +1,7 @@
 // HTTP REST proxy for Discord API with client token authorization.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, header::AUTHORIZATION, Request, Response, StatusCode};
 #[cfg(not(feature = "simd-json"))]
 use serde_json::Value as JsonValue;
@@ -139,14 +139,13 @@ fn resolve_route_scope(path: &str) -> RouteScope {
 
     let route = &segments[base_index..];
 
-    if route.len() >= 2 && route[0] == "gateway" && route[1] == "bot" {
+    // Exact routes only: /users/@me/* reaches every guild of the shared bot
+    // (list guilds, leave a guild, open DMs, edit the bot profile).
+    if route == ["gateway", "bot"] {
         return RouteScope::AllowedWithoutGuild;
     }
 
-    if route.len() >= 2
-        && route[0] == "users"
-        && (route[1] == "@me" || route[1].eq_ignore_ascii_case("%40me"))
-    {
+    if route.len() == 2 && route[0] == "users" && route[1] == "@me" {
         return RouteScope::AllowedWithoutGuild;
     }
 
@@ -189,11 +188,52 @@ fn resolve_route_scope(path: &str) -> RouteScope {
     RouteScope::DeniedWithoutGuild
 }
 
-fn is_client_authorized_for_route(authorized_guilds: &HashSet<u64>, scope: &RouteScope) -> bool {
+/// Rejects paths the upstream client would rewrite before sending: dot
+/// segments (`..`, `%2e%2e`), encoded or literal slashes inside a segment,
+/// and empty segments. The scope check must see the same path Discord sees.
+fn is_canonical_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    rest.split('/').all(|segment| {
+        let Some(decoded) = percent_decode(segment) else {
+            return false;
+        };
+        !decoded.is_empty() && decoded != "." && decoded != ".." && !decoded.contains(['/', '\\'])
+    })
+}
+
+fn percent_decode(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Largest REST body the proxy reads. Discord's biggest uploads (boosted
+/// guilds) are 100 MiB; this keeps one request from using unbounded memory.
+const MAX_REST_BODY_BYTES: usize = 100 * 1024 * 1024 + 64 * 1024;
+
+fn is_client_authorized_for_route(
+    authorized_guilds: &HashSet<u64>,
+    scope: &RouteScope,
+    method: &hyper::Method,
+) -> bool {
     match scope {
         RouteScope::Guild(guild_id) => authorized_guilds.contains(guild_id),
         RouteScope::Channel(_) => false,
-        RouteScope::AllowedWithoutGuild => true,
+        // Read-only: these routes are not scoped to a guild.
+        RouteScope::AllowedWithoutGuild => method == hyper::Method::GET,
         RouteScope::AllowedWithoutAuth => true,
         RouteScope::DeniedWithoutGuild => false,
     }
@@ -464,6 +504,10 @@ pub async fn handle_rest_request(
     }
     .replace("/users/%40me", "/users/@me")
     .replace("/users/%40ME", "/users/@me");
+    if !is_canonical_path(&normalized_path) {
+        warn!("REST request rejected: non-canonical path={normalized_path}");
+        return json_error(StatusCode::BAD_REQUEST, "Non-canonical request path");
+    }
     let normalized_uri = request.uri().query().map_or_else(
         || normalized_path.clone(),
         |query| format!("{}?{}", normalized_path, query),
@@ -526,7 +570,7 @@ pub async fn handle_rest_request(
                 {
                     return error;
                 }
-            } else if !is_client_authorized_for_route(authorized_guilds, &scope) {
+            } else if !is_client_authorized_for_route(authorized_guilds, &scope, request.method()) {
                 warn!(
                     "REST auth rejected route scope: path={}, scope={:?}",
                     normalized_path, scope
@@ -542,11 +586,14 @@ pub async fn handle_rest_request(
     let method = request.method().clone();
     let headers = request.headers().clone();
 
-    let collected_body = match request.into_body().collect().await {
-        Ok(collected) => collected,
-        Err(_) => {
-            return json_error(StatusCode::BAD_REQUEST, "Failed to read request body");
-        }
+    let Ok(collected_body) = Limited::new(request.into_body(), MAX_REST_BODY_BYTES)
+        .collect()
+        .await
+    else {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body too large or unreadable",
+        );
     };
     let body_bytes = collected_body.to_bytes();
 
@@ -647,10 +694,53 @@ pub async fn handle_rest_request(
 mod tests {
     use super::{
         bot_voice_change_guild, channel_scope_decision, classify_channel_lookup_response,
-        resolve_route_scope, should_attach_bot_authorization, should_skip_request_header,
-        should_skip_response_header, ChannelGuildLookup, ChannelScopeDecision, RouteScope,
+        is_canonical_path, is_client_authorized_for_route, resolve_route_scope,
+        should_attach_bot_authorization, should_skip_request_header, should_skip_response_header,
+        ChannelGuildLookup, ChannelScopeDecision, RouteScope,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn rejects_paths_the_upstream_client_would_rewrite() {
+        let cases = [
+            ("/api/v10/guilds/1/channels", true),
+            ("/api/v10/users/@me", true),
+            ("/api/v10/guilds/1/../../users/@me/guilds", false),
+            ("/api/v10/guilds/1/%2e%2e/%2E%2e/users/@me/guilds", false),
+            ("/api/v10/guilds/1/./channels", false),
+            ("/api/v10/guilds/1%2f..%2fusers/@me", false),
+            ("/api/v10/guilds/1%5cchannels", false),
+            ("/api/v10//users/@me", false),
+            ("/api/v10/guilds/1/channels/", false),
+            ("/api/v10/guilds/%zz", false),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(is_canonical_path(path), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn global_routes_are_exact_and_read_only() {
+        let guilds = HashSet::from([1]);
+        let get = hyper::Method::GET;
+        let patch = hyper::Method::PATCH;
+        let cases = [
+            ("/api/v10/users/@me", &get, true),
+            ("/api/v10/gateway/bot", &get, true),
+            ("/api/v10/users/@me", &patch, false),
+            ("/api/v10/users/@me/guilds", &get, false),
+            ("/api/v10/users/@me/guilds/2", &hyper::Method::DELETE, false),
+            ("/api/v10/users/@me/channels", &hyper::Method::POST, false),
+            ("/api/v10/gateway/bot/extra", &get, false),
+        ];
+        for (path, method, expected) in cases {
+            assert_eq!(
+                is_client_authorized_for_route(&guilds, &resolve_route_scope(path), method),
+                expected,
+                "{method} {path}"
+            );
+        }
+    }
 
     #[test]
     fn finds_requests_that_change_the_bot_voice_state() {
