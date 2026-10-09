@@ -52,26 +52,45 @@ fn mark_sync_success() {
     }
 }
 
-fn should_reject_stale_client_data() -> bool {
+/// Freshness of the client registry when the database is the source of auth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClientDataState {
+    /// No database configured: config-seeded clients are the whole truth.
+    NoDatabase,
+    /// Database configured but no sync succeeded yet (startup, failing query).
+    NeverSynced,
+    Fresh,
+    Stale,
+}
+
+fn client_data_state() -> ClientDataState {
     if std::env::var("DIRECT_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
         .is_err()
     {
-        return false;
+        return ClientDataState::NoDatabase;
     }
-
     let last_success = LAST_SUCCESSFUL_SYNC_UNIX_SECS.load(Ordering::Relaxed);
     if last_success == 0 {
-        // Database sync is configured but has not succeeded yet.
-        // Keep startup compatibility with config-seeded clients.
-        return false;
+        return ClientDataState::NeverSynced;
     }
-
     let Some(now_secs) = unix_now_secs() else {
-        return false;
+        return ClientDataState::Fresh;
     };
+    if now_secs.saturating_sub(last_success) > CLIENT_DATA_STALE_AFTER_SECS {
+        return ClientDataState::Stale;
+    }
+    ClientDataState::Fresh
+}
 
-    now_secs.saturating_sub(last_success) > CLIENT_DATA_STALE_AFTER_SECS
+/// Unknown or mismatched credentials are only Invalid when the registry is
+/// known good. Before the first sync (e.g. a deploy whose query fails) they
+/// are Stale: a 401 makes @discordjs/rest drop the client token for good.
+fn unverified(state: ClientDataState) -> ClientAuthResult {
+    match state {
+        ClientDataState::NeverSynced | ClientDataState::Stale => ClientAuthResult::Stale,
+        ClientDataState::NoDatabase | ClientDataState::Fresh => ClientAuthResult::Invalid,
+    }
 }
 
 /// Result of a client authentication attempt.
@@ -102,28 +121,27 @@ pub fn client_has_guild(client_id: &str, guild_id: u64) -> bool {
 
 /// Authenticate a WebSocket client by "client_id:secret" token.
 pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
-    if should_reject_stale_client_data() {
+    // Not a client_id:secret token (e.g. the raw bot token): the caller checks it
+    // against CONFIG.token, which does not depend on the database.
+    let Some((client_id, secret)) = token.split_once(':') else {
+        return ClientAuthResult::Invalid;
+    };
+    let state = client_data_state();
+    if state == ClientDataState::Stale {
         warn!(
             "Rejecting client authentication because database client data is stale (> {}s)",
             CLIENT_DATA_STALE_AFTER_SECS
         );
         return ClientAuthResult::Stale;
     }
-
-    let Some((client_id, secret)) = token.split_once(':') else {
-        return ClientAuthResult::Invalid;
-    };
     let Ok(clients) = CLIENTS.read() else {
-        return ClientAuthResult::Invalid;
+        return unverified(state);
     };
-    let Some(client) = clients.get(client_id) else {
-        return ClientAuthResult::Invalid;
-    };
-
-    if client.secret == secret {
-        ClientAuthResult::Ok(client_id.to_string(), client.guilds.clone())
-    } else {
-        ClientAuthResult::Invalid
+    match clients.get(client_id) {
+        Some(client) if client.secret == secret => {
+            ClientAuthResult::Ok(client_id.to_string(), client.guilds.clone())
+        }
+        _ => unverified(state),
     }
 }
 
