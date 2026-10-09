@@ -92,6 +92,14 @@ pub fn client_guilds(client_id: &str) -> Option<HashSet<u64>> {
     clients.get(client_id).map(|client| client.guilds.clone())
 }
 
+pub fn client_has_guild(client_id: &str, guild_id: u64) -> bool {
+    CLIENTS.read().is_ok_and(|clients| {
+        clients
+            .get(client_id)
+            .is_some_and(|client| client.guilds.contains(&guild_id))
+    })
+}
+
 /// Authenticate a WebSocket client by "client_id:secret" token.
 pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
     if should_reject_stale_client_data() {

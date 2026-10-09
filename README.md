@@ -240,15 +240,17 @@ Discord ──VOICE_SERVER_UPDATE (token)──▶ proxy ──▶ only the voic
 owner ══ voice WebSocket + UDP ══▶ Discord voice server
 ```
 
-Discord allows one voice connection per bot per guild, so each guild has one **voice owner**: the first client that joins. Joins from other clients are dropped until the owner is gone. A leave starts when:
+Discord allows one voice connection per bot per guild, so each guild has one **voice owner**: the first client that joins. Joins from other clients are dropped. The owner gives the guild up when:
 
-- the owner sends a leave, or the bot is kicked from the channel
-- the owner does a fresh IDENTIFY on that shard (its process restarted, so it has no voice connection; without the leave its next join to the same channel would get no events from Discord)
-- the owner stays disconnected for 60s, or loses access to the guild
+- it sends a leave
+- it does a fresh IDENTIFY on that shard (its process restarted and has no voice connection, so the proxy makes the bot leave; a join to the channel the bot is already in may get no events)
+- it stays disconnected for 60s, or loses access to the guild (the proxy makes the bot leave)
 
-The guild stays locked until Discord confirms the leave with the bot's null `VOICE_STATE_UPDATE` (or 5s pass), so a late event of the old call never reaches or frees the next owner. The owner itself can join again at any time. Voice commands check the client's current guilds, not the ones from IDENTIFY.
+Another client gets the guild only when the owner gave it up **and** the bot is out of voice: Discord confirmed the leave with the bot's null `VOICE_STATE_UPDATE`, or the `voice_states` cache shows no voice state for the bot. There is no timer, because Discord gives no delivery bound for queued commands: a late `VOICE_SERVER_UPDATE` of the old call never reaches the next owner. A kick keeps the owner, so it can rejoin. A join that fails (for example a full channel gets no events) keeps the guild until the owner leaves or disconnects; @discordjs/voice clients do that when they give up.
 
-The proxy never caches voice tokens, so every join is a real one. Enable the `voice_states` cache so `GUILD_CREATE` shows where the bot is.
+`VOICE_SERVER_UPDATE` and voice commands check the client's current guilds, not the ones from IDENTIFY. REST requests that change the bot's voice state (Modify Guild Member on the bot with `channel_id`, `mute` or `deaf`, and Modify User Voice State on the bot) are rejected with 403 unless they come from the voice owner.
+
+The proxy never caches voice tokens, so every join is a real one. Enable the `voice_states` cache: `GUILD_CREATE` then shows where the bot is, and without it a leave that gets no event keeps the guild locked.
 
 `tests/voice.e2e.test.ts` runs the real proxy against [discord-digital-twin](../discord-digital-twin) with voice enabled: three clients, a TTS clip played with `@discordjs/voice`, and checks the owner lock, token routing and the received opus frames. It writes the received audio to `tmp/voice/received.wav`.
 

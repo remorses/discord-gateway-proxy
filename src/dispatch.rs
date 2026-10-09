@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     config::CONFIG,
-    db_config::CLIENTS,
+    db_config::{self, CLIENTS},
     deserializer::{EventTypeInfo, GatewayEvent, SequenceInfo},
     model::{parse_json, Ready, ReadyUser, VoiceStateEvent},
     state::{BufferedClientEvent, Shard as ShardState, State},
@@ -50,9 +50,16 @@ fn audience_for(state: &State, event_name: &str, guild_id: Option<u64>) -> Audie
     if event_name != "VOICE_SERVER_UPDATE" {
         return Audience::Guild;
     }
-    match guild_id.and_then(|guild_id| state.voice_owner(guild_id)) {
-        Some(client_id) => Audience::Client(client_id.into()),
-        None => Audience::BotOnly,
+    let Some(guild_id) = guild_id else {
+        return Audience::BotOnly;
+    };
+    // Check current access: a revoked owner keeps the guild until the
+    // sweeper runs, but must not get new tokens meanwhile.
+    match state.voice_owner(guild_id) {
+        Some(client_id) if db_config::client_has_guild(&client_id, guild_id) => {
+            Audience::Client(client_id.into())
+        }
+        _ => Audience::BotOnly,
     }
 }
 
@@ -64,8 +71,8 @@ fn track_bot_voice_state(state: &State, payload: &str, guild_id: Option<u64>) {
     let Some(event) = parse_json::<VoiceStateEvent>(payload) else {
         return;
     };
-    if event.d.user_id.parse::<u64>().ok() == Some(bot_user_id) {
-        state.on_bot_voice_state(guild_id, event.d.channel_id.is_some());
+    if event.d.channel_id.is_none() && event.d.user_id.parse::<u64>().ok() == Some(bot_user_id) {
+        state.on_bot_voice_leave(guild_id);
     }
 }
 

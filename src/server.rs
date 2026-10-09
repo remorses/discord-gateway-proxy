@@ -507,8 +507,9 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                         active_client_id = Some(client_id.clone());
                     }
                     // A fresh IDENTIFY means the client process has no voice
-                    // connection. Leave its calls, otherwise its next join for
-                    // the same channel gets no events from Discord and hangs.
+                    // connection, but the shared bot is still in its calls.
+                    // Leave them, so its next join starts a new call. A join
+                    // to the channel the bot is already in may get no events.
                     for guild_id in state.leave_voice_for_client(client_id, shard_id) {
                         info!("[{addr}] Client {client_id} identified again, leaving voice in guild {guild_id}");
                         state.send_voice_leave(guild_id);

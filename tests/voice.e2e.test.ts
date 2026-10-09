@@ -243,6 +243,13 @@ test('only the owner gets the voice token, and its audio reaches Discord', async
   const stolen = join({ client: beta.client, guildId: GUILD, channelId: VOICE_2 })
   await expectNeverReady(stolen)
   stolen.destroy()
+  // Nor through REST (Modify Guild Member on the bot moves it with the bot token).
+  const restMove = await fetch(`http://127.0.0.1:${proxyPort}/api/v10/guilds/${GUILD}/members/${discord.botUserId}`, {
+    method: 'PATCH',
+    headers: { authorization: `Bot ${BETA}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ channel_id: null }),
+  })
+  expect(restMove.status).toBe(403)
   // gamma is not authorized for this guild: its raw op 4 is dropped too.
   const gamma = await connect(GAMMA)
   await guildOf(gamma.client, OTHER_GUILD).shard.send({

@@ -49,6 +49,15 @@ impl Guilds {
         self.0.stats()
     }
 
+    /// Needs the `voice_states` cache resource.
+    pub fn has_voice_state(&self, guild_id: u64, user_id: u64) -> bool {
+        let (Some(guild_id), Some(user_id)) = (Id::new_checked(guild_id), Id::new_checked(user_id))
+        else {
+            return false;
+        };
+        self.0.voice_state(user_id, guild_id).is_some()
+    }
+
     pub fn resolve_guild_id_for_channel(&self, channel_id: u64) -> Option<u64> {
         self.0.iter().guilds().find_map(|guild| {
             let has_channel = self

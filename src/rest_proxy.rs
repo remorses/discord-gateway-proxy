@@ -10,12 +10,17 @@ use simd_json::prelude::ValueAsScalar;
 #[cfg(feature = "simd-json")]
 use simd_json::OwnedValue as JsonValue;
 
-use std::{collections::HashSet, sync::LazyLock};
+use serde::de::IgnoredAny;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 use tracing::warn;
 
 use crate::{
     auth,
     config::CONFIG,
+    model::parse_json,
     state::{SessionPrincipal, State},
 };
 
@@ -191,6 +196,56 @@ fn is_client_authorized_for_route(authorized_guilds: &HashSet<u64>, scope: &Rout
         RouteScope::AllowedWithoutGuild => true,
         RouteScope::AllowedWithoutAuth => true,
         RouteScope::DeniedWithoutGuild => false,
+    }
+}
+
+/// Guild whose shared bot voice state a request changes: Modify Guild Member
+/// on the bot with `channel_id` (move or disconnect), `mute` or `deaf`, or
+/// Modify User Voice State on the bot (stage). Only the guild's voice owner
+/// may do that, otherwise a tenant could move or end another tenant's call.
+/// An unknown bot ID or an unreadable body counts as a change (fail closed).
+// IgnoredAny values: only the body's keys matter.
+#[allow(clippy::zero_sized_map_values)]
+fn bot_voice_change_guild(
+    method: &hyper::Method,
+    path: &str,
+    body: &[u8],
+    bot_user_id: Option<u64>,
+) -> Option<u64> {
+    if method != hyper::Method::PATCH {
+        return None;
+    }
+    let route: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .skip_while(|segment| *segment == "api" || *segment == "v10")
+        .collect();
+    let [first, guild_id, resource, target] = route[..] else {
+        return None;
+    };
+    let guild_id = parse_snowflake(guild_id)?;
+    let is_bot = target == "@me"
+        || target.eq_ignore_ascii_case("%40me")
+        || bot_user_id.is_none_or(|bot_user_id| parse_snowflake(target) == Some(bot_user_id));
+    if first != "guilds" || !is_bot {
+        return None;
+    }
+    match resource {
+        "voice-states" => Some(guild_id),
+        "members" => {
+            let keys = std::str::from_utf8(body)
+                .ok()
+                .and_then(parse_json::<HashMap<String, IgnoredAny>>);
+            let Some(keys) = keys else {
+                return Some(guild_id);
+            };
+            ["channel_id", "mute", "deaf"]
+                .iter()
+                .any(|field| keys.contains_key(*field))
+                .then_some(guild_id)
+        }
+        _ => None,
     }
 }
 
@@ -495,6 +550,22 @@ pub async fn handle_rest_request(
     };
     let body_bytes = collected_body.to_bytes();
 
+    if let Some(SessionPrincipal::Client(client_id)) =
+        auth_context.as_ref().map(|context| &context.principal)
+    {
+        if let Some(guild_id) =
+            bot_voice_change_guild(&method, &normalized_path, &body_bytes, state.bot_user_id())
+        {
+            if state.voice_owner(guild_id).as_deref() != Some(client_id.as_str()) {
+                warn!("REST bot voice change rejected: client={client_id}, path={normalized_path}");
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    "Only the voice owner of this guild can change the bot's voice state",
+                );
+            }
+        }
+    }
+
     let upstream_url = format!("{}{}", discord_rest_base_url(), normalized_uri);
     let upstream_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(parsed) => parsed,
@@ -575,11 +646,75 @@ pub async fn handle_rest_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_scope_decision, classify_channel_lookup_response, resolve_route_scope,
-        should_attach_bot_authorization, should_skip_request_header, should_skip_response_header,
-        ChannelGuildLookup, ChannelScopeDecision, RouteScope,
+        bot_voice_change_guild, channel_scope_decision, classify_channel_lookup_response,
+        resolve_route_scope, should_attach_bot_authorization, should_skip_request_header,
+        should_skip_response_header, ChannelGuildLookup, ChannelScopeDecision, RouteScope,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn finds_requests_that_change_the_bot_voice_state() {
+        let patch = hyper::Method::PATCH;
+        let bot = Some(42);
+        let cases: [(&hyper::Method, &str, &str, Option<u64>); 9] = [
+            (
+                &patch,
+                "/api/v10/guilds/7/members/42",
+                r#"{"channel_id":"9"}"#,
+                Some(7),
+            ),
+            (
+                &patch,
+                "/api/v10/guilds/7/members/42",
+                r#"{"channel_id":null}"#,
+                Some(7),
+            ),
+            (
+                &patch,
+                "/api/v10/guilds/7/members/42",
+                r#"{"mute":true}"#,
+                Some(7),
+            ),
+            (&patch, "/api/v10/guilds/7/members/42", "not json", Some(7)),
+            (
+                &patch,
+                "/api/v10/guilds/7/voice-states/@me",
+                r#"{"suppress":false}"#,
+                Some(7),
+            ),
+            (
+                &patch,
+                "/api/v10/guilds/7/members/42",
+                r#"{"nick":"bot"}"#,
+                None,
+            ),
+            (
+                &patch,
+                "/api/v10/guilds/7/members/43",
+                r#"{"channel_id":"9"}"#,
+                None,
+            ),
+            (
+                &hyper::Method::GET,
+                "/api/v10/guilds/7/members/42",
+                "",
+                None,
+            ),
+            (
+                &patch,
+                "/api/v10/guilds/7/roles/42",
+                r#"{"channel_id":"9"}"#,
+                None,
+            ),
+        ];
+        for (method, path, body, expected) in cases {
+            assert_eq!(
+                bot_voice_change_guild(method, path, body.as_bytes(), bot),
+                expected,
+                "{method} {path} {body}"
+            );
+        }
+    }
 
     #[test]
     fn resolves_tokenized_routes_as_allowed_without_auth() {
