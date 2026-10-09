@@ -168,6 +168,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         active_client_connections: RwLock::new(HashMap::new()),
         offline_event_buffers: RwLock::new(HashMap::new()),
         last_wake_attempts: RwLock::new(HashMap::new()),
+        client_command_windows: RwLock::new(HashMap::new()),
     });
 
     // Now pipe shard events into broadcasts and state updates.

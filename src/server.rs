@@ -25,12 +25,19 @@ use tokio::{
 use tokio_websockets::{CloseCode, Error, Limits, Message, ServerBuilder};
 use tracing::{debug, error, info, trace, warn};
 
-use std::{collections::HashSet, convert::Infallible, net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     auth,
     deserializer::{GatewayEvent, SequenceInfo},
-    model::{Identify, Resume},
+    dispatch::BroadcastMessage,
+    model::{Identify, OutgoingCommand, RequestGuildMembers, Resume},
     rest_proxy,
     state::{Session, SessionPrincipal, Shard, State},
     upgrade,
@@ -42,6 +49,51 @@ const INVALID_SESSION: &str = r#"{"t":null,"s":null,"op":9,"d":false}"#;
 const RESUMED: &str = r#"{"t":"RESUMED","s":null,"op":0,"d":{}}"#;
 
 const TRAILER: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
+
+const CLIENT_COMMAND_LIMIT: u32 = 20;
+const CLIENT_COMMAND_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientCommand {
+    Forward(String),
+    Drop(&'static str),
+}
+
+/// Decide what a multi-tenant client may send on the shared bot session.
+/// Only guild member requests for an authorized guild go upstream, rebuilt
+/// from parsed fields. Presence (op 3) would change the bot for every tenant.
+/// Voice (op 4) stays blocked until the proxy tracks one voice owner per guild.
+fn filter_client_command(op: u8, payload: &str, authorized_guilds: &HashSet<u64>) -> ClientCommand {
+    if op != 8 {
+        return ClientCommand::Drop("opcode not allowed for multi-tenant clients");
+    }
+
+    #[cfg(feature = "simd-json")]
+    let parsed: Result<RequestGuildMembers, _> =
+        unsafe { simd_json::from_str(&mut payload.to_owned()) };
+    #[cfg(not(feature = "simd-json"))]
+    let parsed: Result<RequestGuildMembers, _> = serde_json::from_str(payload);
+
+    let Ok(request) = parsed else {
+        return ClientCommand::Drop("invalid request guild members payload");
+    };
+    let Ok(guild_id) = request.d.guild_id.parse::<u64>() else {
+        return ClientCommand::Drop("invalid guild_id");
+    };
+    if !authorized_guilds.contains(&guild_id) {
+        return ClientCommand::Drop("guild not authorized");
+    }
+
+    match to_string(&OutgoingCommand {
+        op: 8,
+        d: &request.d,
+    }) {
+        // Discord closes the shared shard with 4002 for payloads over 4096 bytes.
+        Ok(serialized) if serialized.len() <= 4096 => ClientCommand::Forward(serialized),
+        Ok(_) => ClientCommand::Drop("command exceeds gateway payload limit"),
+        Err(_) => ClientCommand::Drop("failed to serialize command"),
+    }
+}
 
 fn compress_full(compressor: &mut Compress, output: &mut Vec<u8>, input: &[u8]) {
     let before_in = compressor.total_in() as usize;
@@ -267,9 +319,18 @@ async fn forward_shard(
     loop {
         let res = event_receiver.recv().await;
 
-        if let Ok((mut payload, sequence, guild_id)) = res {
+        if let Ok(BroadcastMessage {
+            mut payload,
+            sequence,
+            guild_id,
+            for_clients,
+        }) = res
+        {
             // Filter by authorized guilds if specified
             if let Some(ref guilds) = authorized_guilds {
+                if !for_clients {
+                    continue;
+                }
                 match guild_id {
                     Some(gid) => {
                         if !guilds.contains(&gid) {
@@ -332,6 +393,8 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
 
     let mut shard_forward_task = None;
     let mut active_client_id: Option<String> = None;
+    // Set for multi-tenant clients: their commands are filtered before going upstream.
+    let mut command_scope: Option<(String, Arc<HashSet<u64>>)> = None;
     // When true, teardown awaits sink_task flush instead of aborting immediately.
     // Set when we send INVALID_SESSION + close frame and need the client to
     // receive them before the connection drops.
@@ -411,6 +474,10 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                         active_client_id = Some(client_id.clone());
                     }
                 }
+
+                command_scope = identified_client_id
+                    .clone()
+                    .zip(auth.authorized_guilds.clone());
 
                 trace!("[{addr}] Shard ID is {shard_id}");
 
@@ -493,6 +560,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                     debug!("[{addr}] Successfully resuming session {session_id}",);
 
                     let shard = state.shards[session.shard_id as usize].clone();
+                    shard_sender = Some(shard.sender.clone());
                     let authorized_guilds =
                         if matches!(session.principal, SessionPrincipal::Client(_)) {
                             resume_auth.authorized_guilds
@@ -509,6 +577,8 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                             active_client_id = Some(client_id.clone());
                         }
                     }
+
+                    command_scope = resumed_client_id.clone().zip(authorized_guilds.clone());
 
                     if let Some(sender) = compress_tx.take() {
                         shard_forward_task = Some(tokio::spawn(forward_shard(
@@ -545,12 +615,32 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                     break;
                 }
             }
-            _ => {
-                if let Some(sender) = &shard_sender {
+            op => {
+                let Some(sender) = &shard_sender else {
+                    warn!("[{addr}] Client attempted to send payload before IDENTIFY",);
+                    continue;
+                };
+                let Some((client_id, guilds)) = &command_scope else {
                     trace!("[{addr}] Sending {payload:?} to Discord directly");
                     let _res = sender.send(payload.to_string());
-                } else {
-                    warn!("[{addr}] Client attempted to send payload before IDENTIFY",);
+                    continue;
+                };
+                match filter_client_command(op, &payload, guilds) {
+                    ClientCommand::Forward(command) => {
+                        if !state.allow_client_command(
+                            client_id,
+                            CLIENT_COMMAND_LIMIT,
+                            CLIENT_COMMAND_WINDOW,
+                        ) {
+                            warn!("[{addr}] Client {client_id} hit the command rate limit, dropping op {op}");
+                            continue;
+                        }
+                        trace!("[{addr}] Sending filtered op {op} to Discord");
+                        let _res = sender.send(command);
+                    }
+                    ClientCommand::Drop(reason) => {
+                        warn!("[{addr}] Dropped op {op} from client {client_id}: {reason}");
+                    }
                 }
             }
         }
@@ -725,5 +815,66 @@ pub async fn run(port: u16, state: State, metrics_handle: PrometheusHandle) -> R
                 error!("Error handling connection: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_client_command, ClientCommand};
+    use std::collections::HashSet;
+
+    fn guilds() -> HashSet<u64> {
+        HashSet::from([1_422_625_037_164_351_591])
+    }
+
+    #[test]
+    fn forwards_rebuilt_member_request_for_authorized_guild() {
+        let payload = r#"{"op":8,"d":{"guild_id":"1422625037164351591","user_ids":["1","2"],"limit":0,"nonce":"abc","extra":"dropped"}}"#;
+        assert_eq!(
+            filter_client_command(8, payload, &guilds()),
+            ClientCommand::Forward(
+                r#"{"op":8,"d":{"guild_id":"1422625037164351591","limit":0,"user_ids":["1","2"],"nonce":"abc"}}"#
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn drops_commands_outside_scope() {
+        let cases = [
+            (8, r#"{"op":8,"d":{"guild_id":"999","query":"","limit":0}}"#),
+            (
+                8,
+                r#"{"op":8,"d":{"guild_id":["1422625037164351591"],"query":"","limit":0}}"#,
+            ),
+            (
+                8,
+                r#"{"op":8,"d":{"guild_id":"1422625037164351591","guild_id":"999","query":""}}"#,
+            ),
+            (8, r#"{"op":8,"d":{"guild_id":"not-a-snowflake"}}"#),
+            (
+                3,
+                r#"{"op":3,"d":{"since":null,"activities":[],"status":"invisible","afk":false}}"#,
+            ),
+            (
+                4,
+                r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":"1","self_mute":false,"self_deaf":false}}"#,
+            ),
+            (31, r#"{"op":31,"d":{"guild_ids":["1422625037164351591"]}}"#),
+        ];
+        let oversized = format!(
+            r#"{{"op":8,"d":{{"guild_id":"1422625037164351591","query":"{}","limit":1}}}}"#,
+            "a".repeat(5000)
+        );
+        let cases = cases.into_iter().chain([(8, oversized.as_str())]);
+        for (op, payload) in cases {
+            assert!(
+                matches!(
+                    filter_client_command(op, payload, &guilds()),
+                    ClientCommand::Drop(_)
+                ),
+                "op {op} should be dropped: {payload}"
+            );
+        }
     }
 }

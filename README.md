@@ -123,7 +123,15 @@ Guild IDs can be strings or numbers in the config.
 - GUILD_CREATE/GUILD_DELETE events for authorized guilds only
 - Dispatch events that have a `guild_id` matching the authorized set
 
-Events without a `guild_id` (DMs, USER_UPDATE, etc.) are **not forwarded** to multi-tenant clients since they can't be attributed to a specific guild.
+Events without a `guild_id` (DMs, USER_UPDATE, etc.) are **not forwarded** to multi-tenant clients since they can't be attributed to a specific guild. `VOICE_SERVER_UPDATE` is never forwarded to them either: it holds the shared bot's voice token.
+
+All tenants share one bot session, so the proxy also filters what multi-tenant clients send upstream:
+
+| Opcode | Handling |
+| --- | --- |
+| 1 heartbeat, 2 identify, 6 resume | handled by the proxy |
+| 8 request guild members | forwarded only for an authorized guild, rebuilt from parsed fields, max 20 commands per 60s per client |
+| 3 presence, 4 voice state, all others | dropped |
 
 **Backward compatibility:** Clients connecting with the real bot token (or `Bot YOUR_TOKEN`) get all events for all guilds, same as before. The `clients` config is optional -- omitting it preserves the original single-client behavior.
 

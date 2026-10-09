@@ -125,6 +125,9 @@ pub struct Inner {
     pub offline_event_buffers: RwLock<HashMap<String, VecDeque<BufferedClientEvent>>>,
     /// Last wake attempt timestamp per client to avoid wake storms.
     pub last_wake_attempts: RwLock<HashMap<String, Instant>>,
+    /// Fixed-window count of upstream commands per multi-tenant client.
+    /// All tenants share the 120 commands per 60s budget of each shard.
+    pub client_command_windows: RwLock<HashMap<String, (Instant, u32)>>,
 }
 
 impl Inner {
@@ -226,6 +229,20 @@ impl Inner {
         true
     }
 
+    pub fn allow_client_command(&self, client_id: &str, limit: u32, window: Duration) -> bool {
+        let now = Instant::now();
+        let mut windows = self.client_command_windows.write().unwrap();
+        let entry = windows.entry(client_id.to_string()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= window {
+            *entry = (now, 0);
+        }
+        if entry.1 >= limit {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
     /// Remove offline event buffers and wake timestamps for client IDs that
     /// are no longer present in the CLIENTS registry. Without this, entries
     /// for deleted/uninstalled clients accumulate in memory forever.
@@ -237,6 +254,10 @@ impl Inner {
         {
             let mut wakes = self.last_wake_attempts.write().unwrap();
             wakes.retain(|client_id, _| valid_client_ids.contains(client_id));
+        }
+        {
+            let mut windows = self.client_command_windows.write().unwrap();
+            windows.retain(|client_id, _| valid_client_ids.contains(client_id));
         }
     }
 }

@@ -23,9 +23,22 @@ use crate::{
     wake, SHUTDOWN,
 };
 
-/// (payload, sequence_info, guild_id)
-/// guild_id is None for events without a guild context (USER_UPDATE, DMs, etc.)
-pub type BroadcastMessage = (String, Option<SequenceInfo>, Option<u64>);
+#[derive(Clone)]
+pub struct BroadcastMessage {
+    pub payload: String,
+    pub sequence: Option<SequenceInfo>,
+    /// None for events without a guild context (`USER_UPDATE`, DMs, etc.)
+    pub guild_id: Option<u64>,
+    /// False for events that multi-tenant clients must never receive.
+    pub for_clients: bool,
+}
+
+/// `VOICE_SERVER_UPDATE` holds the voice token of the shared bot. Any client in
+/// the guild could use it to join the call as the bot, so only single-tenant
+/// sessions (bot token) receive it.
+fn is_bot_only_event(event_name: &str) -> bool {
+    event_name == "VOICE_SERVER_UPDATE"
+}
 
 const TEN_SECONDS: Duration = Duration::from_secs(10);
 const WAKE_COOLDOWN: Duration = Duration::from_secs(10);
@@ -192,7 +205,12 @@ pub async fn events(
                 let payload_copy = payload.clone();
                 trace!("[Shard {shard_id}] Sending payload to clients: {payload_copy:?}",);
 
-                let _res = broadcast_tx.send((payload_copy.clone(), sequence.clone(), guild_id));
+                let _res = broadcast_tx.send(BroadcastMessage {
+                    payload: payload_copy.clone(),
+                    sequence: sequence.clone(),
+                    guild_id,
+                    for_clients: !is_bot_only_event(event_name),
+                });
 
                 if should_buffer_event(event_name) {
                     buffer_event_for_disconnected_clients(
