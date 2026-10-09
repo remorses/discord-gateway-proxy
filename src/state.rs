@@ -4,7 +4,10 @@ use twilight_gateway::MessageSender;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -12,6 +15,51 @@ use crate::{cache, dispatch::BroadcastMessage, model::JsonObject};
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const OFFLINE_EVENT_BUFFER_LIMIT: usize = 200;
+/// How long a voice owner may stay disconnected before the bot leaves its call.
+pub const VOICE_OWNER_GRACE: Duration = Duration::from_secs(60);
+/// How long a guild stays locked after a leave that Discord never confirms
+/// (for example a leave sent while the bot was not in voice).
+pub const VOICE_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The multi-tenant client that owns the shared bot's voice connection in a
+/// guild. Discord allows one voice connection per bot per guild, and the
+/// `VOICE_SERVER_UPDATE` token must only reach the client that asked for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceOwner {
+    pub client_id: String,
+    /// Set while the owner has no live gateway connection.
+    pub disconnected_at: Option<Instant>,
+    /// Set from a leave until Discord confirms it with the bot's null voice
+    /// state. The guild stays locked meanwhile, so events of the old call
+    /// (late `VOICE_SERVER_UPDATE`, the null state) cannot reach or free the
+    /// next owner.
+    pub leaving_since: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum VoiceDecision {
+    Allow,
+    Deny,
+}
+
+/// Whether `client_id` may send a voice state update in a guild with `owner`.
+/// The first client takes the guild; others wait until the owner's leave is
+/// confirmed (the owner is removed) or times out.
+pub fn decide_voice_command(
+    owner: Option<&VoiceOwner>,
+    client_id: &str,
+    now: Instant,
+) -> VoiceDecision {
+    match owner {
+        None => VoiceDecision::Allow,
+        Some(owner) if owner.client_id == client_id => VoiceDecision::Allow,
+        Some(VoiceOwner {
+            leaving_since: Some(at),
+            ..
+        }) if now.duration_since(*at) >= VOICE_LEAVE_TIMEOUT => VoiceDecision::Allow,
+        Some(_) => VoiceDecision::Deny,
+    }
+}
 
 #[derive(Clone)]
 pub struct BufferedClientEvent {
@@ -128,6 +176,10 @@ pub struct Inner {
     /// Fixed-window count of upstream commands per multi-tenant client.
     /// All tenants share the 120 commands per 60s budget of each shard.
     pub client_command_windows: RwLock<HashMap<String, (Instant, u32)>>,
+    /// Guild ID -> client that owns the bot's voice connection there.
+    pub voice_owners: RwLock<HashMap<u64, VoiceOwner>>,
+    /// The bot user ID from READY, 0 until the first READY.
+    pub bot_user_id: AtomicU64,
 }
 
 impl Inner {
@@ -180,6 +232,8 @@ impl Inner {
         let mut active = self.active_client_connections.write().unwrap();
         let current = active.get(client_id).copied().unwrap_or(0);
         active.insert(client_id.to_string(), current + 1);
+        drop(active);
+        self.set_voice_owner_disconnected(client_id, None);
     }
 
     pub fn mark_client_disconnected(&self, client_id: &str) {
@@ -187,9 +241,138 @@ impl Inner {
         let current = active.get(client_id).copied().unwrap_or(0);
         if current <= 1 {
             active.remove(client_id);
+            drop(active);
+            self.set_voice_owner_disconnected(client_id, Some(Instant::now()));
             return;
         }
         active.insert(client_id.to_string(), current - 1);
+    }
+
+    fn set_voice_owner_disconnected(&self, client_id: &str, at: Option<Instant>) {
+        let mut owners = self.voice_owners.write().unwrap();
+        for owner in owners.values_mut() {
+            if owner.client_id == client_id {
+                owner.disconnected_at = at;
+            }
+        }
+    }
+
+    pub fn voice_owner(&self, guild_id: u64) -> Option<String> {
+        let owners = self.voice_owners.read().unwrap();
+        owners.get(&guild_id).map(|owner| owner.client_id.clone())
+    }
+
+    /// Records the voice command as the new state of the guild if allowed.
+    /// A join takes ownership; a leave starts the leave transition.
+    pub fn claim_voice(&self, guild_id: u64, client_id: &str, joining: bool) -> VoiceDecision {
+        let now = Instant::now();
+        let mut owners = self.voice_owners.write().unwrap();
+        let decision = decide_voice_command(owners.get(&guild_id), client_id, now);
+        if decision == VoiceDecision::Allow {
+            if joining {
+                owners.insert(
+                    guild_id,
+                    VoiceOwner {
+                        client_id: client_id.to_string(),
+                        disconnected_at: None,
+                        leaving_since: None,
+                    },
+                );
+            } else if let Some(owner) = owners.get_mut(&guild_id) {
+                owner.leaving_since = Some(now);
+            }
+        }
+        decision
+    }
+
+    /// Starts the leave transition for every guild a client owns on a shard
+    /// and returns the guilds the bot must leave.
+    pub fn leave_voice_for_client(&self, client_id: &str, shard_id: u32) -> Vec<u64> {
+        let now = Instant::now();
+        let mut owners = self.voice_owners.write().unwrap();
+        let mut guilds = Vec::new();
+        for (guild_id, owner) in owners.iter_mut() {
+            if owner.client_id == client_id
+                && owner.leaving_since.is_none()
+                && self.shard_id_for_guild(*guild_id) == shard_id
+            {
+                owner.leaving_since = Some(now);
+                guilds.push(*guild_id);
+            }
+        }
+        guilds
+    }
+
+    /// The bot's own `VOICE_STATE_UPDATE`. A null channel confirms a leave
+    /// (the owner is removed); without a pending leave it is a kick or the
+    /// leave before an owner's rejoin, so it only starts the transition. A
+    /// channel means the owner's join went through.
+    pub fn on_bot_voice_state(&self, guild_id: u64, in_channel: bool) {
+        let mut owners = self.voice_owners.write().unwrap();
+        let Some(owner) = owners.get_mut(&guild_id) else {
+            return;
+        };
+        if in_channel {
+            owner.leaving_since = None;
+        } else if owner.leaving_since.is_some() {
+            owners.remove(&guild_id);
+        } else {
+            owner.leaving_since = Some(Instant::now());
+        }
+    }
+
+    /// Starts the leave transition for owners that stayed disconnected past
+    /// the grace period or lost access to the guild (`authorized` is client
+    /// ID -> guilds), and drops leaves that timed out. Returns the guilds the
+    /// bot must leave.
+    pub fn take_stale_voice_owners(&self, authorized: &HashMap<String, HashSet<u64>>) -> Vec<u64> {
+        let now = Instant::now();
+        let mut owners = self.voice_owners.write().unwrap();
+        owners.retain(|_, owner| {
+            owner
+                .leaving_since
+                .is_none_or(|at| now.duration_since(at) < VOICE_LEAVE_TIMEOUT)
+        });
+        let mut guilds = Vec::new();
+        for (guild_id, owner) in owners.iter_mut() {
+            let expired = owner
+                .disconnected_at
+                .is_some_and(|at| now.duration_since(at) >= VOICE_OWNER_GRACE);
+            let revoked = !authorized
+                .get(&owner.client_id)
+                .is_some_and(|guilds| guilds.contains(guild_id));
+            if owner.leaving_since.is_none() && (expired || revoked) {
+                owner.leaving_since = Some(now);
+                guilds.push(*guild_id);
+            }
+        }
+        guilds
+    }
+
+    pub fn shard_id_for_guild(&self, guild_id: u64) -> u32 {
+        ((guild_id >> 22) % u64::from(self.shard_count)) as u32
+    }
+
+    pub fn shard_for_guild(&self, guild_id: u64) -> Option<&Arc<Shard>> {
+        let shard_id = self.shard_id_for_guild(guild_id);
+        self.shards.iter().find(|shard| shard.id == shard_id)
+    }
+
+    /// Makes the bot leave voice in a guild.
+    pub fn send_voice_leave(&self, guild_id: u64) {
+        let Some(shard) = self.shard_for_guild(guild_id) else {
+            return;
+        };
+        let _res = shard.sender.send(format!(
+            r#"{{"op":4,"d":{{"guild_id":"{guild_id}","channel_id":null,"self_mute":false,"self_deaf":false}}}}"#
+        ));
+    }
+
+    pub fn bot_user_id(&self) -> Option<u64> {
+        match self.bot_user_id.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
     }
 
     pub fn is_client_connected(&self, client_id: &str) -> bool {
@@ -264,3 +447,38 @@ impl Inner {
 
 /// A reference to the [`StateInner`] of the proxy.
 pub type State = Arc<Inner>;
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_voice_command, VoiceDecision, VoiceOwner, VOICE_LEAVE_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    fn owner(leaving_since: Option<Instant>) -> VoiceOwner {
+        VoiceOwner {
+            client_id: "a".to_string(),
+            disconnected_at: None,
+            leaving_since,
+        }
+    }
+
+    #[test]
+    fn voice_owner_keeps_the_guild_until_its_leave_is_done() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(1);
+        let timed_out = now - VOICE_LEAVE_TIMEOUT;
+        let cases = [
+            (None, "b", VoiceDecision::Allow),
+            (Some(owner(None)), "a", VoiceDecision::Allow),
+            (Some(owner(None)), "b", VoiceDecision::Deny),
+            (Some(owner(Some(recent))), "a", VoiceDecision::Allow),
+            (Some(owner(Some(recent))), "b", VoiceDecision::Deny),
+            (Some(owner(Some(timed_out))), "b", VoiceDecision::Allow),
+        ];
+        for (owner, client_id, expected) in cases {
+            assert_eq!(
+                decide_voice_command(owner.as_ref(), client_id, now),
+                expected
+            );
+        }
+    }
+}

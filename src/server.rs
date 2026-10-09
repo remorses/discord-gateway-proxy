@@ -34,12 +34,12 @@ use std::{
 };
 
 use crate::{
-    auth,
+    auth, db_config,
     deserializer::{GatewayEvent, SequenceInfo},
-    dispatch::BroadcastMessage,
-    model::{Identify, OutgoingCommand, RequestGuildMembers, Resume},
+    dispatch::{Audience, BroadcastMessage},
+    model::{parse_json, Identify, OutgoingCommand, RequestGuildMembers, Resume, VoiceStateUpdate},
     rest_proxy,
-    state::{Session, SessionPrincipal, Shard, State},
+    state::{Session, SessionPrincipal, Shard, State, VoiceDecision},
     upgrade,
 };
 
@@ -55,43 +55,70 @@ const CLIENT_COMMAND_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum ClientCommand {
-    Forward(String),
+    /// Send upstream on the shard of `guild_id`.
+    Forward {
+        guild_id: u64,
+        command: String,
+    },
+    /// Voice state update: also needs the channel check and the voice owner lock.
+    Voice {
+        guild_id: u64,
+        channel_id: Option<u64>,
+        command: String,
+    },
     Drop(&'static str),
 }
 
 /// Decide what a multi-tenant client may send on the shared bot session.
-/// Only guild member requests for an authorized guild go upstream, rebuilt
-/// from parsed fields. Presence (op 3) would change the bot for every tenant.
-/// Voice (op 4) stays blocked until the proxy tracks one voice owner per guild.
+/// Only guild member requests (op 8) and voice state updates (op 4) for an
+/// authorized guild go upstream, rebuilt from parsed fields. Presence (op 3)
+/// would change the bot for every tenant.
 fn filter_client_command(op: u8, payload: &str, authorized_guilds: &HashSet<u64>) -> ClientCommand {
-    if op != 8 {
-        return ClientCommand::Drop("opcode not allowed for multi-tenant clients");
-    }
-
-    #[cfg(feature = "simd-json")]
-    let parsed: Result<RequestGuildMembers, _> =
-        unsafe { simd_json::from_str(&mut payload.to_owned()) };
-    #[cfg(not(feature = "simd-json"))]
-    let parsed: Result<RequestGuildMembers, _> = serde_json::from_str(payload);
-
-    let Ok(request) = parsed else {
-        return ClientCommand::Drop("invalid request guild members payload");
+    let (guild_id, channel_id, serialized) = match op {
+        8 => {
+            let Some(request) = parse_json::<RequestGuildMembers>(payload) else {
+                return ClientCommand::Drop("invalid request guild members payload");
+            };
+            let serialized = to_string(&OutgoingCommand { op, d: &request.d });
+            (request.d.guild_id, None, serialized)
+        }
+        4 => {
+            let Some(update) = parse_json::<VoiceStateUpdate>(payload) else {
+                return ClientCommand::Drop("invalid voice state update payload");
+            };
+            let serialized = to_string(&OutgoingCommand { op, d: &update.d });
+            (update.d.guild_id, Some(update.d.channel_id), serialized)
+        }
+        _ => return ClientCommand::Drop("opcode not allowed for multi-tenant clients"),
     };
-    let Ok(guild_id) = request.d.guild_id.parse::<u64>() else {
+
+    let Ok(guild_id) = guild_id.parse::<u64>() else {
         return ClientCommand::Drop("invalid guild_id");
     };
     if !authorized_guilds.contains(&guild_id) {
         return ClientCommand::Drop("guild not authorized");
     }
-
-    match to_string(&OutgoingCommand {
-        op: 8,
-        d: &request.d,
-    }) {
+    let command = match serialized {
         // Discord closes the shared shard with 4002 for payloads over 4096 bytes.
-        Ok(serialized) if serialized.len() <= 4096 => ClientCommand::Forward(serialized),
-        Ok(_) => ClientCommand::Drop("command exceeds gateway payload limit"),
-        Err(_) => ClientCommand::Drop("failed to serialize command"),
+        Ok(command) if command.len() <= 4096 => command,
+        Ok(_) => return ClientCommand::Drop("command exceeds gateway payload limit"),
+        Err(_) => return ClientCommand::Drop("failed to serialize command"),
+    };
+    match channel_id {
+        None => ClientCommand::Forward { guild_id, command },
+        Some(None) => ClientCommand::Voice {
+            guild_id,
+            channel_id: None,
+            command,
+        },
+        Some(Some(channel_id)) => match channel_id.parse::<u64>() {
+            Ok(channel_id) => ClientCommand::Voice {
+                guild_id,
+                channel_id: Some(channel_id),
+                command,
+            },
+            Err(_) => ClientCommand::Drop("invalid channel_id"),
+        },
     }
 }
 
@@ -285,6 +312,7 @@ async fn forward_shard(
     // For formatting the sequence number as a string, reuse a buffer.
     let mut buffer = Buffer::new();
 
+    let own_client_id = client_id.clone();
     // Replay buffered offline events before subscribing to live stream.
     if let Some(client_id) = client_id {
         let buffered = state.drain_offline_events_for_client(&client_id);
@@ -323,12 +351,17 @@ async fn forward_shard(
             mut payload,
             sequence,
             guild_id,
-            for_clients,
+            audience,
         }) = res
         {
             // Filter by authorized guilds if specified
             if let Some(ref guilds) = authorized_guilds {
-                if !for_clients {
+                let allowed = match &audience {
+                    Audience::Guild => true,
+                    Audience::BotOnly => false,
+                    Audience::Client(owner) => own_client_id.as_deref() == Some(&**owner),
+                };
+                if !allowed {
                     continue;
                 }
                 match guild_id {
@@ -394,7 +427,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     let mut shard_forward_task = None;
     let mut active_client_id: Option<String> = None;
     // Set for multi-tenant clients: their commands are filtered before going upstream.
-    let mut command_scope: Option<(String, Arc<HashSet<u64>>)> = None;
+    let mut command_scope: Option<String> = None;
     // When true, teardown awaits sink_task flush instead of aborting immediately.
     // Set when we send INVALID_SESSION + close frame and need the client to
     // receive them before the connection drops.
@@ -473,11 +506,16 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                         state.mark_client_connected(client_id);
                         active_client_id = Some(client_id.clone());
                     }
+                    // A fresh IDENTIFY means the client process has no voice
+                    // connection. Leave its calls, otherwise its next join for
+                    // the same channel gets no events from Discord and hangs.
+                    for guild_id in state.leave_voice_for_client(client_id, shard_id) {
+                        info!("[{addr}] Client {client_id} identified again, leaving voice in guild {guild_id}");
+                        state.send_voice_leave(guild_id);
+                    }
                 }
 
-                command_scope = identified_client_id
-                    .clone()
-                    .zip(auth.authorized_guilds.clone());
+                command_scope.clone_from(&identified_client_id);
 
                 trace!("[{addr}] Shard ID is {shard_id}");
 
@@ -578,7 +616,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                         }
                     }
 
-                    command_scope = resumed_client_id.clone().zip(authorized_guilds.clone());
+                    command_scope.clone_from(&resumed_client_id);
 
                     if let Some(sender) = compress_tx.take() {
                         shard_forward_task = Some(tokio::spawn(forward_shard(
@@ -620,28 +658,57 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                     warn!("[{addr}] Client attempted to send payload before IDENTIFY",);
                     continue;
                 };
-                let Some((client_id, guilds)) = &command_scope else {
+                let Some(client_id) = &command_scope else {
                     trace!("[{addr}] Sending {payload:?} to Discord directly");
                     let _res = sender.send(payload.to_string());
                     continue;
                 };
-                match filter_client_command(op, &payload, guilds) {
-                    ClientCommand::Forward(command) => {
-                        if !state.allow_client_command(
-                            client_id,
-                            CLIENT_COMMAND_LIMIT,
-                            CLIENT_COMMAND_WINDOW,
-                        ) {
-                            warn!("[{addr}] Client {client_id} hit the command rate limit, dropping op {op}");
+                let guilds = db_config::client_guilds(client_id).unwrap_or_default();
+                let (guild_id, voice_channel, command) =
+                    match filter_client_command(op, &payload, &guilds) {
+                        ClientCommand::Forward { guild_id, command } => (guild_id, None, command),
+                        ClientCommand::Voice {
+                            guild_id,
+                            channel_id,
+                            command,
+                        } => (guild_id, Some(channel_id), command),
+                        ClientCommand::Drop(reason) => {
+                            warn!("[{addr}] Dropped op {op} from client {client_id}: {reason}");
                             continue;
                         }
-                        trace!("[{addr}] Sending filtered op {op} to Discord");
-                        let _res = sender.send(command);
-                    }
-                    ClientCommand::Drop(reason) => {
-                        warn!("[{addr}] Dropped op {op} from client {client_id}: {reason}");
+                    };
+                if let Some(Some(channel_id)) = voice_channel {
+                    if state.resolve_guild_id_for_channel(channel_id) != Some(guild_id) {
+                        warn!("[{addr}] Dropped op 4 from client {client_id}: channel {channel_id} not in guild {guild_id}");
+                        continue;
                     }
                 }
+                if !state.allow_client_command(
+                    client_id,
+                    CLIENT_COMMAND_LIMIT,
+                    CLIENT_COMMAND_WINDOW,
+                ) {
+                    warn!(
+                        "[{addr}] Client {client_id} hit the command rate limit, dropping op {op}"
+                    );
+                    continue;
+                }
+                if let Some(channel_id) = voice_channel {
+                    if state.claim_voice(guild_id, client_id, channel_id.is_some())
+                        == VoiceDecision::Deny
+                    {
+                        warn!("[{addr}] Dropped op 4 from client {client_id}: guild {guild_id} voice is owned by another client");
+                        continue;
+                    }
+                }
+                let Some(shard) = state.shard_for_guild(guild_id) else {
+                    warn!(
+                        "[{addr}] Dropped op {op}: shard of guild {guild_id} is not on this proxy"
+                    );
+                    continue;
+                };
+                trace!("[{addr}] Sending filtered op {op} to Discord");
+                let _res = shard.sender.send(command);
             }
         }
     }
@@ -823,24 +890,50 @@ mod tests {
     use super::{filter_client_command, ClientCommand};
     use std::collections::HashSet;
 
+    const GUILD: u64 = 1_422_625_037_164_351_591;
+
     fn guilds() -> HashSet<u64> {
-        HashSet::from([1_422_625_037_164_351_591])
+        HashSet::from([GUILD])
     }
 
     #[test]
-    fn forwards_rebuilt_member_request_for_authorized_guild() {
-        let payload = r#"{"op":8,"d":{"guild_id":"1422625037164351591","user_ids":["1","2"],"limit":0,"nonce":"abc","extra":"dropped"}}"#;
+    fn forwards_rebuilt_commands_for_authorized_guild() {
+        let members = r#"{"op":8,"d":{"guild_id":"1422625037164351591","user_ids":["1","2"],"limit":0,"nonce":"abc","extra":"dropped"}}"#;
         assert_eq!(
-            filter_client_command(8, payload, &guilds()),
-            ClientCommand::Forward(
-                r#"{"op":8,"d":{"guild_id":"1422625037164351591","limit":0,"user_ids":["1","2"],"nonce":"abc"}}"#
-                    .to_string()
-            )
+            filter_client_command(8, members, &guilds()),
+            ClientCommand::Forward {
+                guild_id: GUILD,
+                command: r#"{"op":8,"d":{"guild_id":"1422625037164351591","limit":0,"user_ids":["1","2"],"nonce":"abc"}}"#
+                    .to_string(),
+            }
+        );
+        let join = r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":"7","self_mute":false,"self_deaf":true,"self_video":true}}"#;
+        assert_eq!(
+            filter_client_command(4, join, &guilds()),
+            ClientCommand::Voice {
+                guild_id: GUILD,
+                channel_id: Some(7),
+                command: r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":"7","self_mute":false,"self_deaf":true}}"#
+                    .to_string(),
+            }
+        );
+        let leave = r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":null,"self_mute":false,"self_deaf":false}}"#;
+        assert_eq!(
+            filter_client_command(4, leave, &guilds()),
+            ClientCommand::Voice {
+                guild_id: GUILD,
+                channel_id: None,
+                command: leave.to_string(),
+            }
         );
     }
 
     #[test]
     fn drops_commands_outside_scope() {
+        let oversized = format!(
+            r#"{{"op":8,"d":{{"guild_id":"1422625037164351591","query":"{}","limit":1}}}}"#,
+            "a".repeat(5000)
+        );
         let cases = [
             (8, r#"{"op":8,"d":{"guild_id":"999","query":"","limit":0}}"#),
             (
@@ -852,21 +945,25 @@ mod tests {
                 r#"{"op":8,"d":{"guild_id":"1422625037164351591","guild_id":"999","query":""}}"#,
             ),
             (8, r#"{"op":8,"d":{"guild_id":"not-a-snowflake"}}"#),
+            (8, oversized.as_str()),
             (
                 3,
                 r#"{"op":3,"d":{"since":null,"activities":[],"status":"invisible","afk":false}}"#,
             ),
             (
                 4,
-                r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":"1","self_mute":false,"self_deaf":false}}"#,
+                r#"{"op":4,"d":{"guild_id":"999","channel_id":"1","self_mute":false,"self_deaf":false}}"#,
+            ),
+            (
+                4,
+                r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":"x","self_mute":false,"self_deaf":false}}"#,
+            ),
+            (
+                4,
+                r#"{"op":4,"d":{"guild_id":"1422625037164351591","channel_id":"1"}}"#,
             ),
             (31, r#"{"op":31,"d":{"guild_ids":["1422625037164351591"]}}"#),
         ];
-        let oversized = format!(
-            r#"{{"op":8,"d":{{"guild_id":"1422625037164351591","query":"{}","limit":1}}}}"#,
-            "a".repeat(5000)
-        );
-        let cases = cases.into_iter().chain([(8, oversized.as_str())]);
         for (op, payload) in cases {
             assert!(
                 matches!(

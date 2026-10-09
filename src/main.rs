@@ -169,6 +169,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         offline_event_buffers: RwLock::new(HashMap::new()),
         last_wake_attempts: RwLock::new(HashMap::new()),
         client_command_windows: RwLock::new(HashMap::new()),
+        voice_owners: RwLock::new(HashMap::new()),
+        bot_user_id: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Now pipe shard events into broadcasts and state updates.
@@ -251,6 +253,31 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
             };
             state_for_cleanup.prune_stale_client_state(&valid_ids);
+        }
+    });
+
+    // Make the bot leave voice for owners that stayed disconnected past the
+    // grace period or lost access to the guild.
+    let state_for_voice = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            let authorized: HashMap<String, std::collections::HashSet<u64>> =
+                match db_config::CLIENTS.read() {
+                    Ok(clients) => clients
+                        .iter()
+                        .map(|(client_id, config)| (client_id.clone(), config.guilds.clone()))
+                        .collect(),
+                    Err(e) => {
+                        warn!("Skipping voice owner cleanup: CLIENTS lock poisoned: {e}");
+                        continue;
+                    }
+                };
+            for guild_id in state_for_voice.take_stale_voice_owners(&authorized) {
+                info!("Leaving voice in guild {guild_id}: owner gone");
+                state_for_voice.send_voice_leave(guild_id);
+            }
         }
     });
 

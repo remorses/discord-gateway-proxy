@@ -123,15 +123,18 @@ Guild IDs can be strings or numbers in the config.
 - GUILD_CREATE/GUILD_DELETE events for authorized guilds only
 - Dispatch events that have a `guild_id` matching the authorized set
 
-Events without a `guild_id` (DMs, USER_UPDATE, etc.) are **not forwarded** to multi-tenant clients since they can't be attributed to a specific guild. `VOICE_SERVER_UPDATE` is never forwarded to them either: it holds the shared bot's voice token.
+Events without a `guild_id` (DMs, USER_UPDATE, etc.) are **not forwarded** to multi-tenant clients since they can't be attributed to a specific guild. `VOICE_SERVER_UPDATE` only goes to the guild's voice owner (see [Voice](#voice)).
 
 All tenants share one bot session, so the proxy also filters what multi-tenant clients send upstream:
 
 | Opcode | Handling |
 | --- | --- |
 | 1 heartbeat, 2 identify, 6 resume | handled by the proxy |
-| 8 request guild members | forwarded only for an authorized guild, rebuilt from parsed fields, max 20 commands per 60s per client |
-| 3 presence, 4 voice state, all others | dropped |
+| 8 request guild members | forwarded only for an authorized guild, rebuilt from parsed fields |
+| 4 voice state | same, plus the channel must be in that guild and the client must own the guild's voice (see [Voice](#voice)) |
+| 3 presence, all others | dropped |
+
+Ops 4 and 8 share a limit of 20 commands per 60s per client, and go out on the shard of their guild.
 
 **Backward compatibility:** Clients connecting with the real bot token (or `Bot YOUR_TOKEN`) get all events for all guilds, same as before. The `clients` config is optional -- omitting it preserves the original single-client behavior.
 
@@ -226,9 +229,36 @@ If you have not configured a shard count manually, you can check the amount of s
 
 The proxy exposes Prometheus metrics at the `/metrics` endpoint. They contain event counters, cache size and shard latency histograms specific to each shard.
 
+## Voice
+
+The proxy carries only voice signaling. Audio goes from the client straight to Discord's voice server over UDP.
+
+```
+client ──op 4 join──▶ proxy (guild authorized? channel in guild? voice owner?) ──▶ Discord
+Discord ──VOICE_STATE_UPDATE (bot)──▶ proxy ──▶ every client in the guild (shows the bot is busy)
+Discord ──VOICE_SERVER_UPDATE (token)──▶ proxy ──▶ only the voice owner
+owner ══ voice WebSocket + UDP ══▶ Discord voice server
+```
+
+Discord allows one voice connection per bot per guild, so each guild has one **voice owner**: the first client that joins. Joins from other clients are dropped until the owner is gone. A leave starts when:
+
+- the owner sends a leave, or the bot is kicked from the channel
+- the owner does a fresh IDENTIFY on that shard (its process restarted, so it has no voice connection; without the leave its next join to the same channel would get no events from Discord)
+- the owner stays disconnected for 60s, or loses access to the guild
+
+The guild stays locked until Discord confirms the leave with the bot's null `VOICE_STATE_UPDATE` (or 5s pass), so a late event of the old call never reaches or frees the next owner. The owner itself can join again at any time. Voice commands check the client's current guilds, not the ones from IDENTIFY.
+
+The proxy never caches voice tokens, so every join is a real one. Enable the `voice_states` cache so `GUILD_CREATE` shows where the bot is.
+
+`tests/voice.e2e.test.ts` runs the real proxy against [discord-digital-twin](../discord-digital-twin) with voice enabled: three clients, a TTS clip played with `@discordjs/voice`, and checks the owner lock, token routing and the received opus frames. It writes the received audio to `tmp/voice/received.wav`.
+
+```bash
+pnpm exec vitest run tests/voice.e2e.test.ts
+```
+
 ## Caveats
 
-Voice support, while being present for a while, has been removed entirely. This is because the proxy would have to track voice sessions as sent by Discord, while also accounting for other caveats. I currently don't use this feature and would much prefer Discord to add a voice session API to their HTTP endpoints. The old implementation of this was ugly and very quickly hacked together; I would definitely appreciate a PR to implement this in a pretty and well-documented way, but won't do it myself for now.
+A deploy restarts the upstream shard, which ends all voice calls.
 
 ## Performance
 
@@ -334,7 +364,3 @@ How it works when the bot is already installed:
 5. Machine B polls onboarding status and starts using `client_id:secret`
 
 So there is still only one shared bot in the guild, but there can be many authorized client identities (one per machine) in `gateway_clients`.
-
-## Known Issues / TODOs
-
-- Re-add voice support

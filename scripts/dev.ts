@@ -59,7 +59,7 @@ async function run() {
             stage_instances: false,
             stickers: false,
             users: false,
-            voice_states: false,
+            voice_states: true,
         },
         token,
     }

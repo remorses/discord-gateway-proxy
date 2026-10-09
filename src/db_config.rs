@@ -85,6 +85,13 @@ pub enum ClientAuthResult {
     Invalid,
 }
 
+/// Current authorized guilds of a client. Commands check this, not the set
+/// from IDENTIFY, so a revoked guild stops working on open connections too.
+pub fn client_guilds(client_id: &str) -> Option<HashSet<u64>> {
+    let clients = CLIENTS.read().ok()?;
+    clients.get(client_id).map(|client| client.guilds.clone())
+}
+
 /// Authenticate a WebSocket client by "client_id:secret" token.
 pub fn authenticate_client_with_id(token: &str) -> ClientAuthResult {
     if should_reject_stale_client_data() {

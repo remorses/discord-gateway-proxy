@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[cfg(not(feature = "simd-json"))]
 use serde_json::Value as OwnedValue;
 #[cfg(feature = "simd-json")]
@@ -56,6 +56,56 @@ pub struct RequestGuildMembersInfo {
 pub enum UserIds {
     One(String),
     Many(Vec<String>),
+}
+
+/// Opcode 4. Rebuilt like opcode 8.
+#[derive(Deserialize)]
+pub struct VoiceStateUpdate {
+    pub d: VoiceStateUpdateInfo,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct VoiceStateUpdateInfo {
+    pub guild_id: String,
+    pub channel_id: Option<String>,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+}
+
+/// The bot user in READY.
+#[derive(Deserialize)]
+pub struct ReadyUser {
+    pub d: ReadyUserInfo,
+}
+
+#[derive(Deserialize)]
+pub struct ReadyUserInfo {
+    pub user: IdOnly,
+}
+
+#[derive(Deserialize)]
+pub struct IdOnly {
+    pub id: String,
+}
+
+/// The fields of a `VOICE_STATE_UPDATE` dispatch the proxy needs.
+#[derive(Deserialize)]
+pub struct VoiceStateEvent {
+    pub d: VoiceStateEventInfo,
+}
+
+#[derive(Deserialize)]
+pub struct VoiceStateEventInfo {
+    pub user_id: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+pub fn parse_json<T: DeserializeOwned>(payload: &str) -> Option<T> {
+    #[cfg(feature = "simd-json")]
+    return unsafe { simd_json::from_str(&mut payload.to_owned()) }.ok();
+    #[cfg(not(feature = "simd-json"))]
+    return serde_json::from_str(payload).ok();
 }
 
 #[derive(Serialize)]

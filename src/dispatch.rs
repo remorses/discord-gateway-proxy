@@ -18,7 +18,7 @@ use crate::{
     config::CONFIG,
     db_config::CLIENTS,
     deserializer::{EventTypeInfo, GatewayEvent, SequenceInfo},
-    model::Ready,
+    model::{parse_json, Ready, ReadyUser, VoiceStateEvent},
     state::{BufferedClientEvent, Shard as ShardState, State},
     wake, SHUTDOWN,
 };
@@ -29,15 +29,44 @@ pub struct BroadcastMessage {
     pub sequence: Option<SequenceInfo>,
     /// None for events without a guild context (`USER_UPDATE`, DMs, etc.)
     pub guild_id: Option<u64>,
-    /// False for events that multi-tenant clients must never receive.
-    pub for_clients: bool,
+    /// Which multi-tenant clients may receive the event.
+    pub audience: Audience,
 }
 
-/// `VOICE_SERVER_UPDATE` holds the voice token of the shared bot. Any client in
-/// the guild could use it to join the call as the bot, so only single-tenant
-/// sessions (bot token) receive it.
-fn is_bot_only_event(event_name: &str) -> bool {
-    event_name == "VOICE_SERVER_UPDATE"
+#[derive(Clone)]
+pub enum Audience {
+    /// Every client authorized for the guild.
+    Guild,
+    /// Only single-tenant sessions (bot token).
+    BotOnly,
+    /// Only this multi-tenant client (and single-tenant sessions).
+    Client(Arc<str>),
+}
+
+/// `VOICE_SERVER_UPDATE` holds the voice token of the shared bot. Any client
+/// with it can join the call as the bot, so it only goes to the guild's voice
+/// owner.
+fn audience_for(state: &State, event_name: &str, guild_id: Option<u64>) -> Audience {
+    if event_name != "VOICE_SERVER_UPDATE" {
+        return Audience::Guild;
+    }
+    match guild_id.and_then(|guild_id| state.voice_owner(guild_id)) {
+        Some(client_id) => Audience::Client(client_id.into()),
+        None => Audience::BotOnly,
+    }
+}
+
+/// Feeds the bot's own voice state into the voice owner lock.
+fn track_bot_voice_state(state: &State, payload: &str, guild_id: Option<u64>) {
+    let (Some(guild_id), Some(bot_user_id)) = (guild_id, state.bot_user_id()) else {
+        return;
+    };
+    let Some(event) = parse_json::<VoiceStateEvent>(payload) else {
+        return;
+    };
+    if event.d.user_id.parse::<u64>().ok() == Some(bot_user_id) {
+        state.on_bot_voice_state(guild_id, event.d.channel_id.is_some());
+    }
 }
 
 const TEN_SECONDS: Duration = Duration::from_secs(10);
@@ -193,6 +222,12 @@ pub async fn events(
                     CONFIG.externally_accessible_url.clone().into(),
                 );
 
+                if let Some(id) = parse_json::<ReadyUser>(&payload)
+                    .and_then(|ready_user| ready_user.d.user.id.parse::<u64>().ok())
+                {
+                    state.bot_user_id.store(id, Ordering::Relaxed);
+                }
+
                 // We don't care if it was already set
                 // since this data is timeless
                 shard_state.ready.set_ready(ready.d);
@@ -203,13 +238,16 @@ pub async fn events(
                 // We only want to relay dispatchable events, not RESUMEs and not READY
                 // because we fake a READY event
                 let payload_copy = payload.clone();
+                if event_name == "VOICE_STATE_UPDATE" {
+                    track_bot_voice_state(&state, &payload_copy, guild_id);
+                }
                 trace!("[Shard {shard_id}] Sending payload to clients: {payload_copy:?}",);
 
                 let _res = broadcast_tx.send(BroadcastMessage {
                     payload: payload_copy.clone(),
                     sequence: sequence.clone(),
                     guild_id,
-                    for_clients: !is_bot_only_event(event_name),
+                    audience: audience_for(&state, event_name, guild_id),
                 });
 
                 if should_buffer_event(event_name) {
