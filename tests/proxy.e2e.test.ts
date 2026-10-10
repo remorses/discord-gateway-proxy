@@ -322,6 +322,17 @@ test('a binary or oversized frame before IDENTIFY does not take the proxy down',
   expect(await proxyAlive()).toBe(true)
 })
 
+// A discord.js reconnect race can leave the shard sending on a socket that
+// never identified. Like Discord, the proxy closes it so the client reconnects.
+test('a command before IDENTIFY closes the socket with 4003', async () => {
+  const socket = new WebSocket(`ws://127.0.0.1:${proxyPort}`)
+  await new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }))
+  const closed = new Promise<number>((resolve) => socket.addEventListener('close', (event) => resolve(event.code), { once: true }))
+  socket.send(JSON.stringify({ op: 1, d: null }))
+  socket.send(JSON.stringify({ op: 4, d: { guild_id: GUILD, channel_id: VOICE_1, self_mute: false, self_deaf: false } }))
+  expect(await closed).toBe(4003)
+})
+
 test('REST: global bot routes are exact and read-only, dot segments are rejected', async () => {
   expect({
     usersMe: await rawRequest({ path: '/api/v10/users/@me', token: ALPHA }),

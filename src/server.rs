@@ -50,6 +50,11 @@ const RESUMED: &str = r#"{"t":"RESUMED","s":null,"op":0,"d":{}}"#;
 
 const TRAILER: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 
+/// Two heartbeat intervals from HELLO. Like Discord, a client that stops
+/// heartbeating is a zombie and gets closed. Without this a socket that
+/// discord.js leaked during a reconnect race stays open forever.
+const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2 * 41_250);
+
 const CLIENT_COMMAND_LIMIT: u32 = 20;
 const CLIENT_COMMAND_WINDOW: Duration = Duration::from_secs(60);
 
@@ -468,12 +473,23 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     let mut graceful_close = false;
 
     let mut sink_done = false;
+    let heartbeat_timeout = tokio::time::sleep(CLIENT_HEARTBEAT_TIMEOUT);
+    tokio::pin!(heartbeat_timeout);
     loop {
         let msg = tokio::select! {
             msg = stream.next() => msg,
             // The sink ended: write error, or the client stopped reading.
             _ = &mut sink_task => {
                 sink_done = true;
+                break;
+            }
+            () = &mut heartbeat_timeout => {
+                warn!("[{addr}] Client sent no heartbeat for {CLIENT_HEARTBEAT_TIMEOUT:?}, disconnecting");
+                let _res = stream_writer.send(Message::close(
+                    Some(CloseCode::try_from(4009u16).unwrap()),
+                    "session timed out",
+                ));
+                graceful_close = true;
                 break;
             }
         };
@@ -497,6 +513,9 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
         match deserializer.op() {
             1 => {
                 trace!("[{addr}] Sending heartbeat ACK");
+                heartbeat_timeout
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + CLIENT_HEARTBEAT_TIMEOUT);
                 let _res = stream_writer.send(Message::text(HEARTBEAT_ACK.to_string()));
             }
             2 => {
@@ -708,8 +727,15 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
             }
             op => {
                 let Some(sender) = &shard_sender else {
-                    warn!("[{addr}] Client attempted to send payload before IDENTIFY",);
-                    continue;
+                    // Close like Discord does, so the client reconnects and
+                    // identifies instead of sending into a dead socket.
+                    warn!("[{addr}] Client attempted to send payload before IDENTIFY, disconnecting");
+                    let _res = stream_writer.send(Message::close(
+                        Some(CloseCode::try_from(4003u16).unwrap()),
+                        "not authenticated",
+                    ));
+                    graceful_close = true;
+                    break;
                 };
                 let Some(client_id) = &command_scope else {
                     trace!("[{addr}] Sending {payload:?} to Discord directly");
