@@ -167,6 +167,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         sessions: RwLock::new(HashMap::new()),
         active_client_connections: RwLock::new(HashMap::new()),
         offline_event_buffers: RwLock::new(HashMap::new()),
+        unacked_events: RwLock::new(HashMap::new()),
+        next_connection_id: std::sync::atomic::AtomicU64::new(0),
         last_wake_attempts: RwLock::new(HashMap::new()),
         client_command_windows: RwLock::new(HashMap::new()),
         voice_owners: RwLock::new(HashMap::new()),

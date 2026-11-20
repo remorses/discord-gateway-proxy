@@ -29,7 +29,7 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     net::SocketAddr,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -37,9 +37,14 @@ use crate::{
     auth, db_config,
     deserializer::{GatewayEvent, SequenceInfo},
     dispatch::{Audience, BroadcastMessage},
-    model::{parse_json, Identify, OutgoingCommand, RequestGuildMembers, Resume, VoiceStateUpdate},
+    model::{
+        parse_json, Heartbeat, Identify, OutgoingCommand, RequestGuildMembers, Resume,
+        VoiceStateUpdate,
+    },
     rest_proxy,
-    state::{Session, SessionPrincipal, Shard, State, VoiceDecision},
+    state::{
+        BufferedClientEvent, Session, SessionPrincipal, Shard, State, UnackedEvent, VoiceDecision,
+    },
     upgrade,
 };
 
@@ -295,6 +300,7 @@ async fn forward_shard(
     authorized_guilds: Option<Arc<HashSet<u64>>>,
     state: State,
     client_id: Option<String>,
+    connection: u64,
 ) {
     let shard_id = shard_status.id;
 
@@ -352,10 +358,41 @@ async fn forward_shard(
             |client_id| db_config::client_has_guild(client_id, guild_id),
         )
     };
-    // Replay buffered offline events before subscribing to live stream.
+    // Rewrites the sequence number and keeps user messages until the client's
+    // heartbeat confirms them.
+    let mut send = |mut event: BufferedClientEvent| {
+        if let Some(SequenceInfo(_, ref sequence_range)) = event.sequence {
+            seq += 1;
+            let unacked = own_client_id
+                .as_deref()
+                .filter(|_| event.user_message)
+                .map(|client_id| (client_id, event.clone()));
+            event
+                .payload
+                .replace_range(sequence_range.clone(), buffer.format(seq));
+            if let Some((client_id, unacked)) = unacked {
+                state.record_unacked_event(
+                    client_id,
+                    UnackedEvent {
+                        connection,
+                        seq,
+                        event: unacked,
+                    },
+                );
+            }
+        }
+        let _res = stream_writer.send(Message::text(event.payload));
+    };
+
+    // Subscribe before the replay, so no event falls between the two.
+    let mut event_receiver = shard_status.events.subscribe();
+
+    // Replay events a dead earlier socket never confirmed, then events buffered
+    // while offline.
     if let Some(client_id) = client_id {
-        let buffered = state.drain_offline_events_for_client(&client_id);
-        for mut event in buffered {
+        let mut buffered = state.take_unacked_events(&client_id, connection);
+        buffered.extend(state.drain_offline_events_for_client(&client_id));
+        for event in buffered {
             if let Some(ref guilds) = authorized_guilds {
                 match event.guild_id {
                     Some(gid) => {
@@ -368,29 +405,19 @@ async fn forward_shard(
                     }
                 }
             }
-
-            if let Some(SequenceInfo(_, sequence_range)) = event.sequence {
-                seq += 1;
-                event
-                    .payload
-                    .replace_range(sequence_range, buffer.format(seq));
-            }
-
-            let _res = stream_writer.send(Message::text(event.payload));
+            send(event);
         }
     }
-
-    // Subscribe to events for this shard
-    let mut event_receiver = shard_status.events.subscribe();
 
     loop {
         let res = event_receiver.recv().await;
 
         if let Ok(BroadcastMessage {
-            mut payload,
+            payload,
             sequence,
             guild_id,
             audience,
+            user_message,
         }) = res
         {
             // Filter by authorized guilds if specified
@@ -418,13 +445,12 @@ async fn forward_shard(
                 }
             }
 
-            // Overwrite the sequence number
-            if let Some(SequenceInfo(_, sequence_range)) = sequence {
-                seq += 1;
-                payload.replace_range(sequence_range, buffer.format(seq));
-            }
-
-            let _res = stream_writer.send(Message::text(payload));
+            send(BufferedClientEvent {
+                payload,
+                sequence,
+                guild_id,
+                user_message,
+            });
         } else if let Err(RecvError::Lagged(amt)) = res {
             warn!("[Shard {shard_id}] Client is {amt} events behind!");
         }
@@ -471,6 +497,9 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     // Set when we send INVALID_SESSION + close frame and need the client to
     // receive them before the connection drops.
     let mut graceful_close = false;
+    let connection = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    // The client closed with 1000: it shut down after reading every event.
+    let mut client_shutdown = false;
 
     let mut sink_done = false;
     let heartbeat_timeout = tokio::time::sleep(CLIENT_HEARTBEAT_TIMEOUT);
@@ -496,6 +525,11 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
         let Some(Ok(msg)) = msg else {
             break;
         };
+        if let Some((code, _)) = msg.as_close() {
+            // discord.js closes a zombie socket with 4200 and resumes: not read.
+            client_shutdown = code == CloseCode::NORMAL_CLOSURE;
+            break;
+        }
         // Gateway clients send JSON text. Binary frames (ETF, garbage) are ignored.
         let Some(text) = msg.as_text() else {
             continue;
@@ -517,6 +551,11 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                     .as_mut()
                     .reset(tokio::time::Instant::now() + CLIENT_HEARTBEAT_TIMEOUT);
                 let _res = stream_writer.send(Message::text(HEARTBEAT_ACK.to_string()));
+                if let (Some(client_id), Some(Heartbeat { d: Some(seq) })) =
+                    (&active_client_id, parse_json::<Heartbeat>(&payload))
+                {
+                    state.ack_events(client_id, connection, seq);
+                }
             }
             2 => {
                 debug!("[{addr}] Client is identifying");
@@ -615,6 +654,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                         auth.authorized_guilds,
                         state.clone(),
                         identified_client_id,
+                        connection,
                     )));
 
                     let _res = sender.send(identify.d.compress);
@@ -700,6 +740,7 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
                             authorized_guilds,
                             state.clone(),
                             resumed_client_id,
+                            connection,
                         )));
 
                         let _res = sender.send(session.compress);
@@ -821,6 +862,9 @@ pub async fn handle_client<S: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     }
 
     if let Some(client_id) = active_client_id {
+        if client_shutdown {
+            state.drop_unacked_events(&client_id, connection);
+        }
         state.mark_client_disconnected(&client_id);
     }
 
