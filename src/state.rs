@@ -15,8 +15,6 @@ use crate::{cache, config::CONFIG, dispatch::BroadcastMessage, model::JsonObject
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const OFFLINE_EVENT_BUFFER_LIMIT: usize = 200;
-/// Per client. Heartbeats clear them every 41s, and only user messages count.
-const UNACKED_EVENT_LIMIT: usize = 20;
 /// How long a voice owner may stay disconnected before the bot leaves its call.
 pub const VOICE_OWNER_GRACE: Duration = Duration::from_secs(60);
 
@@ -63,24 +61,6 @@ pub struct BufferedClientEvent {
     pub payload: String,
     pub sequence: Option<crate::deserializer::SequenceInfo>,
     pub guild_id: Option<u64>,
-    /// A `MESSAGE_CREATE` not sent by the shared bot.
-    pub user_message: bool,
-}
-
-/// A user message sent on a client connection whose heartbeat has not
-/// confirmed its sequence number yet.
-pub struct UnackedEvent {
-    pub connection: u64,
-    pub seq: usize,
-    pub event: BufferedClientEvent,
-}
-
-#[derive(Default)]
-pub struct ClientUnacked {
-    /// The newest connection that took the unacked events. Older dead
-    /// sockets stop recording: that connection gets their events live.
-    newest_connection: u64,
-    events: VecDeque<UnackedEvent>,
 }
 
 /// Manager for the READY state of a shard.
@@ -186,11 +166,6 @@ pub struct Inner {
     pub active_client_connections: RwLock<HashMap<String, usize>>,
     /// Last buffered dispatch events for disconnected clients.
     pub offline_event_buffers: RwLock<HashMap<String, VecDeque<BufferedClientEvent>>>,
-    /// User messages sent to a client that its heartbeat did not confirm yet.
-    /// A socket that died without a close still counts as connected until the
-    /// heartbeat timeout, so events sent meanwhile would be lost without this.
-    pub unacked_events: RwLock<HashMap<String, ClientUnacked>>,
-    pub next_connection_id: AtomicU64,
     /// Last wake attempt timestamp per client to avoid wake storms.
     pub last_wake_attempts: RwLock<HashMap<String, Instant>>,
     /// Fixed-window count of upstream commands per multi-tenant client.
@@ -427,54 +402,6 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    pub fn record_unacked_event(&self, client_id: &str, unacked: UnackedEvent) {
-        let mut clients = self.unacked_events.write().unwrap();
-        let client = clients.entry(client_id.to_string()).or_default();
-        if unacked.connection < client.newest_connection {
-            return;
-        }
-        if client.events.len() >= UNACKED_EVENT_LIMIT {
-            let _ = client.events.pop_front();
-        }
-        client.events.push_back(unacked);
-    }
-
-    /// A heartbeat carries the last sequence number the client received.
-    pub fn ack_events(&self, client_id: &str, connection: u64, seq: usize) {
-        if let Some(client) = self.unacked_events.write().unwrap().get_mut(client_id) {
-            client
-                .events
-                .retain(|unacked| unacked.connection != connection || unacked.seq > seq);
-        }
-    }
-
-    /// Unconfirmed events of the client's earlier connections, for replay on
-    /// a new one. A client only connects again after it gave up the old socket.
-    /// Call after subscribing to live events, so none falls in between.
-    pub fn take_unacked_events(
-        &self,
-        client_id: &str,
-        connection: u64,
-    ) -> Vec<BufferedClientEvent> {
-        let mut clients = self.unacked_events.write().unwrap();
-        let client = clients.entry(client_id.to_string()).or_default();
-        client.newest_connection = connection;
-        std::mem::take(&mut client.events)
-            .into_iter()
-            .map(|unacked| unacked.event)
-            .collect()
-    }
-
-    /// A client that closes with code 1000 shut down after reading everything.
-    /// Any other end keeps the events for the next connection.
-    pub fn drop_unacked_events(&self, client_id: &str, connection: u64) {
-        if let Some(client) = self.unacked_events.write().unwrap().get_mut(client_id) {
-            client
-                .events
-                .retain(|unacked| unacked.connection != connection);
-        }
-    }
-
     pub fn should_wake_client(&self, client_id: &str, cooldown: Duration) -> bool {
         let now = Instant::now();
         let mut wakes = self.last_wake_attempts.write().unwrap();
@@ -511,10 +438,6 @@ impl Inner {
             buffers.retain(|client_id, _| valid_client_ids.contains(client_id));
         }
         {
-            let mut events = self.unacked_events.write().unwrap();
-            events.retain(|client_id, _| valid_client_ids.contains(client_id));
-        }
-        {
             let mut wakes = self.last_wake_attempts.write().unwrap();
             wakes.retain(|client_id, _| valid_client_ids.contains(client_id));
         }
@@ -530,70 +453,7 @@ pub type State = Arc<Inner>;
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        decide_voice_command, BufferedClientEvent, Inner, UnackedEvent, VoiceDecision, VoiceOwner,
-    };
-    use std::{
-        collections::HashMap,
-        sync::{atomic::AtomicU64, RwLock},
-    };
-
-    fn empty_state() -> Inner {
-        Inner {
-            shards: Vec::new(),
-            shard_count: 1,
-            sessions: RwLock::new(HashMap::new()),
-            active_client_connections: RwLock::new(HashMap::new()),
-            offline_event_buffers: RwLock::new(HashMap::new()),
-            unacked_events: RwLock::new(HashMap::new()),
-            next_connection_id: AtomicU64::new(0),
-            last_wake_attempts: RwLock::new(HashMap::new()),
-            client_command_windows: RwLock::new(HashMap::new()),
-            voice_owners: RwLock::new(HashMap::new()),
-            bot_user_id: AtomicU64::new(0),
-        }
-    }
-
-    fn send(state: &Inner, connection: u64, seq: usize) {
-        let event = BufferedClientEvent {
-            payload: format!("m{connection}-{seq}"),
-            sequence: None,
-            guild_id: Some(1),
-            user_message: true,
-        };
-        state.record_unacked_event(
-            "c",
-            UnackedEvent {
-                connection,
-                seq,
-                event,
-            },
-        );
-    }
-
-    fn payloads(events: Vec<BufferedClientEvent>) -> Vec<String> {
-        events.into_iter().map(|event| event.payload).collect()
-    }
-
-    #[test]
-    fn unconfirmed_messages_of_a_dead_socket_reach_the_next_one() {
-        let state = empty_state();
-        send(&state, 0, 3);
-        send(&state, 0, 4);
-        state.ack_events("c", 0, 3);
-        // The client reconnects while the dead socket is still open.
-        assert_eq!(payloads(state.take_unacked_events("c", 1)), ["m0-4"]);
-        // The dead socket keeps getting events; the new connection gets them live.
-        send(&state, 0, 5);
-        send(&state, 1, 1);
-        // The new connection dies too, before confirming anything.
-        assert_eq!(payloads(state.take_unacked_events("c", 2)), ["m1-1"]);
-
-        // A shutdown with close code 1000 read everything.
-        send(&state, 2, 1);
-        state.drop_unacked_events("c", 2);
-        assert!(state.take_unacked_events("c", 3).is_empty());
-    }
+    use super::{decide_voice_command, VoiceDecision, VoiceOwner};
 
     fn owner(wants_voice: bool) -> VoiceOwner {
         VoiceOwner {

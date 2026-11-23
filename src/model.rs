@@ -88,22 +88,6 @@ pub struct IdOnly {
     pub id: String,
 }
 
-#[derive(Deserialize)]
-pub struct MessageAuthor {
-    pub d: MessageAuthorInfo,
-}
-
-#[derive(Deserialize)]
-pub struct MessageAuthorInfo {
-    pub author: IdOnly,
-}
-
-/// Opcode 1. `d` is the last sequence number the client received.
-#[derive(Deserialize)]
-pub struct Heartbeat {
-    pub d: Option<usize>,
-}
-
 /// The fields of a `VOICE_STATE_UPDATE` dispatch the proxy needs.
 #[derive(Deserialize)]
 pub struct VoiceStateEvent {

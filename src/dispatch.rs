@@ -18,7 +18,7 @@ use crate::{
     config::CONFIG,
     db_config::{self, CLIENTS},
     deserializer::{EventTypeInfo, GatewayEvent, SequenceInfo},
-    model::{parse_json, MessageAuthor, Ready, ReadyUser, VoiceStateEvent},
+    model::{parse_json, Ready, ReadyUser, VoiceStateEvent},
     state::{BufferedClientEvent, Shard as ShardState, State},
     wake, SHUTDOWN,
 };
@@ -31,18 +31,6 @@ pub struct BroadcastMessage {
     pub guild_id: Option<u64>,
     /// Which multi-tenant clients may receive the event.
     pub audience: Audience,
-    /// A `MESSAGE_CREATE` not sent by the shared bot: kept until the client
-    /// confirms it, so a dead socket does not lose prompts.
-    pub user_message: bool,
-}
-
-fn is_user_message(state: &State, event_name: &str, payload: &str) -> bool {
-    if event_name != "MESSAGE_CREATE" {
-        return false;
-    }
-    let author =
-        parse_json::<MessageAuthor>(payload).and_then(|m| m.d.author.id.parse::<u64>().ok());
-    author.is_some() && author != state.bot_user_id()
 }
 
 #[derive(Clone)]
@@ -108,7 +96,6 @@ fn buffer_event_for_disconnected_clients(
     payload: &str,
     sequence: Option<SequenceInfo>,
     guild_id: Option<u64>,
-    user_message: bool,
 ) {
     let Some(guild_id) = guild_id else {
         return;
@@ -133,7 +120,6 @@ fn buffer_event_for_disconnected_clients(
                             payload: payload.to_string(),
                             sequence: sequence.clone(),
                             guild_id: Some(guild_id),
-                            user_message,
                         },
                     );
 
@@ -264,13 +250,11 @@ pub async fn events(
                 }
                 trace!("[Shard {shard_id}] Sending payload to clients: {payload_copy:?}",);
 
-                let user_message = is_user_message(&state, event_name, &payload_copy);
                 let _res = broadcast_tx.send(BroadcastMessage {
                     payload: payload_copy.clone(),
                     sequence: sequence.clone(),
                     guild_id,
                     audience: audience_for(&state, event_name, guild_id),
-                    user_message,
                 });
 
                 if should_buffer_event(event_name) {
@@ -279,7 +263,6 @@ pub async fn events(
                         &payload_copy,
                         sequence,
                         guild_id,
-                        user_message,
                     );
                 }
                 if wake::should_show_wake_typing(event_name) {

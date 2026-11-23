@@ -41,6 +41,8 @@ const OTHER_GUILD = '500000000000000002'
 const VOICE_1 = '500000000000000011'
 const VOICE_2 = '500000000000000012'
 const OTHER_VOICE = '500000000000000013'
+const OTHER_TEXT = '500000000000000014'
+const USER = '500000000000000015'
 const ALPHA = 'alpha:secret-a'
 const BETA = 'beta:secret-b'
 const GAMMA = 'gamma:secret-c'
@@ -146,9 +148,14 @@ beforeAll(async () => {
   const voiceChannel = (id: string, name: string) => ({ id, name, type: ChannelType.GuildVoice })
   discord = new DigitalDiscord({
     voice: true,
+    users: [{ id: USER, username: 'tester' }],
     guilds: [
       { id: GUILD, name: 'Shared', channels: [voiceChannel(VOICE_1, 'one'), voiceChannel(VOICE_2, 'two')] },
-      { id: OTHER_GUILD, name: 'Other', channels: [voiceChannel(OTHER_VOICE, 'other')] },
+      {
+        id: OTHER_GUILD,
+        name: 'Other',
+        channels: [voiceChannel(OTHER_VOICE, 'other'), { id: OTHER_TEXT, name: 'prompts', type: ChannelType.GuildText }],
+      },
     ],
   })
   await Promise.all([
@@ -331,6 +338,47 @@ test('a command before IDENTIFY closes the socket with 4003', async () => {
   socket.send(JSON.stringify({ op: 1, d: null }))
   socket.send(JSON.stringify({ op: 4, d: { guild_id: GUILD, channel_id: VOICE_1, self_mute: false, self_deaf: false } }))
   expect(await closed).toBe(4003)
+})
+
+test('a fresh IDENTIFY does not replay a delivered message without a heartbeat', async () => {
+  const sockets: WebSocket[] = []
+  const identify = async () => {
+    const socket = new WebSocket(`ws://127.0.0.1:${proxyPort}`)
+    sockets.push(socket)
+    const received: string[] = []
+    socket.addEventListener('message', ({ data }) => {
+      const event = JSON.parse(String(data))
+      if (event.t === 'MESSAGE_CREATE') received.push(event.d.content)
+    })
+    const ready = new Promise<void>((resolve) => {
+      socket.addEventListener('message', ({ data }) => {
+        if (JSON.parse(String(data)).t === 'GUILD_CREATE') resolve()
+      })
+    })
+    await new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }))
+    socket.send(JSON.stringify({
+      op: 2,
+      d: { token: GAMMA, intents: GatewayIntentBits.GuildMessages, properties: {}, shard: [0, 1], compress: false },
+    }))
+    await ready
+    return { socket, received }
+  }
+  const user = discord.channel(OTHER_TEXT).user(USER)
+  try {
+    const first = await identify()
+    await user.sendMessage({ content: 'delivered before disconnect' })
+    await expect.poll(() => first.received).toEqual(['delivered before disconnect'])
+    const closed = new Promise((resolve) => first.socket.addEventListener('close', resolve, { once: true }))
+    first.socket.close(4200)
+    await closed
+
+    const second = await identify()
+    await user.sendMessage({ content: 'sent after reconnect' })
+    await expect.poll(() => second.received.at(-1)).toBe('sent after reconnect')
+    expect(second.received).toEqual(['sent after reconnect'])
+  } finally {
+    for (const socket of sockets) socket.close()
+  }
 })
 
 test('REST: global bot routes are exact and read-only, dot segments are rejected', async () => {
